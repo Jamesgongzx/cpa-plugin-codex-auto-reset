@@ -1,8 +1,11 @@
 # Codex Auto Reset
 
+This checkout is an owner patch based on upstream `v0.1.14`. Its source and
+default Makefile build identify it as `0.1.14-owner-recovery.2`.
+
 `codex-auto-reset` is a CLIProxyAPI (CPA) dynamic library plugin that
 automatically redeems the soonest-expiring Codex "Reset Bank" credit on each
-enabled account before it expires, so no credit is ever lost to forgetfulness.
+enabled account when its identity, credit and quota evidence permit it.
 
 Codex/ChatGPT accounts accumulate rate-limit reset credits that a user can
 manually redeem to reset their weekly rate-limit window. These credits expire,
@@ -17,7 +20,7 @@ plus the standard plugin lifecycle and Management API surface.
 
 ## How It Works
 
-For each enabled Codex account, the plugin runs a 6-state state machine:
+For each enabled Codex account, the plugin runs a state machine:
 
 ```
 IDLE       → patrol every refresh_interval; if the soonest-expiring credit's
@@ -26,20 +29,22 @@ ARMED      → sleep directly to the trigger time T = expiry − trigger_lead_ti
              (no polling); on wake, enter CONFIRMING
 CONFIRMING → re-list credits; validate the pinned target is still available,
              unexpired, and due; if early, re-arm the same ID at its fresh T;
-             otherwise fetch usage, mint a redeem_request_id, enter RESETTING
+             otherwise fetch usage, bind the user seat, mint a request ID
 RESETTING  → POST /consume with {redeem_request_id, credit_id}; on success
              enter VERIFYING; on transient error retry (same idempotency key,
-             1/2/5/10/30 min backoff, max 5); on 4xx or no_credit stop
+             1/2/5/10/30 min backoff, max 5); unresolved outcomes reconcile
 VERIFYING  → after 1 min, re-list + fetch usage; triple deduction check
-             (target gone + count −1 + weekly recovered); enter DONE
-DONE       → cycle complete; back to IDLE
+             (target gone + count −1 + observed weekly recovery)
+RECONCILING → retain the original credit/request, seat and retry budget;
+              reconcile first, then retry that same request if permitted
+DONE       → persist the resolved outcome before returning to IDLE
 ```
 
-An automatic cycle never substitutes another credit if its pinned target
-is redeemed, removed, or expired, even if another credit is already due. A
-missing target ID also abandons the cycle. Credits with no expiry are never
-automatically redeemed; if the pinned target becomes non-expiring, that cycle
-is abandoned. The next IDLE patrol can schedule a new cycle normally.
+An automatic cycle never substitutes another credit for its pinned target.
+Before the first POST, a missing, unavailable, expired or non-expiring target
+abandons the unsent cycle. After a POST may have been sent, a missing target
+requires reconciliation. No new credit cycle starts while its outcome remains
+unresolved. Credits with no expiry are never automatically redeemed.
 
 **Check** (including Check All) pulls only IDLE accounts to an immediate
 patrol; it never authorizes an early reset. Accounts inside an active cycle
@@ -49,10 +54,13 @@ time, so an early wake cannot bypass it. **Reset** explicitly requests immediate
 confirmation, clears the old automatic target, and selects the currently
 soonest-expiring available credit, even far before its trigger time (or with
 no expiry). It still runs the full confirm, consume, and verify flow. Repeated
-Reset requests during consume/retry or verification leave that active attempt
-intact. Returning to IDLE clears both the pinned target and manual intent.
+Reset requests during consume/retry, verification or reconciliation leave that
+active attempt intact. Automatic consumption requires a measured weekly value
+before dispatch. Manual Reset can still run without that pre-reset value, but
+successful verification requires observed weekly recovery. Both paths require
+a known credential seat. Returning to IDLE clears the target and manual intent.
 
-**Safety invariants** (covered by production tests and the simulation in `sim/`):
+**Safety invariants** (covered by focused production tests):
 
 1. **Serial per account.** Only one POST /consume is ever in flight per
    account per cycle. All retries reuse the same target and
@@ -60,9 +68,43 @@ intact. Returning to IDLE clears both the pinned target and manual intent.
 2. **Always targeted.** The consume body always carries `credit_id`. Automatic
    confirmation validates the ID pinned when arming, not a newly selected
    credit. Manual Reset explicitly selects a fresh available target.
-3. **Triple deduction check.** Verification requires (a) the target credit is
-   gone, (b) `available_count` decreased by exactly 1, AND (c) weekly quota
-   recovered. Any mismatch halts immediately — no compensating request is sent.
+3. **Consumption and quota evidence.** Verification requires a recognized
+   Consume acceptance for the original request or the exact target's returned
+   `redeemed` status. It separately checks that the target is unavailable,
+   `available_count` decreased by exactly 1, and measured weekly capacity is
+   full or increased. Missing weekly data is unknown. Missing or expired credit
+   rows and a count drop never establish consumption by themselves, including
+   when weekly capacity was already 100%. Unresolved evidence retains the
+   original attempt without a replacement credit.
+
+### Restart And Ambiguous Outcomes
+
+The complete attempt is stored in the existing `state.json`, including its
+credit/request pair, non-secret seat fingerprint, send count and next retry
+time. Each POST requires a successful synchronous checkpoint using a synced
+temporary file and atomic rename. A failed checkpoint sends no POST. Settings
+changes and shutdown join the old worker, including its final save, before a
+successor can run. Disabling an account preserves its pending attempt.
+
+On restart, a dispatched attempt reconciles against the same target first.
+An available target may resume the existing same-ID, same-credit protocol with
+the remaining retry budget and backoff. Inventory presence alone does not
+prove that the earlier POST failed. Replay safety depends on the upstream
+service honoring that idempotent protocol; local fixture tests do not prove
+upstream behavior. Exhausted retries, unknown response codes, missing evidence
+or incomplete legacy attempts remain in reconciliation and cannot select a
+different credit. Exact returned statuses are retained separately from the
+filtered candidate list. A lost response can resolve when its target is reported
+redeemed and the separate quota checks pass; natural expiry or disappearance
+alone remains unresolved. This relies on the private upstream protocol's
+response/status meanings, which local fixtures do not establish for a live
+account. Later affirmative consumption and quota evidence can finish the attempt.
+
+The bearer token's stable user subject and workspace identify its seat. Token
+rotation for that same seat is accepted. Unknown or changed claims retain the
+attempt and suspend its work until the original identity is available. CPA
+remains the credential refresh owner; the plugin does not log in or refresh
+OAuth credentials. No tokens are stored in the attempt or its logs.
 
 ## Privacy And Data Disclosure
 
@@ -105,7 +147,8 @@ migration from older locations; superseded files are kept as `.migrated`):
 1. `state_dir` from the plugin's `config_yaml` block (operator override,
    must be an absolute path)
 2. `<CPA auth dir>/plugin-state/codex-auto-reset/state.json` — derived from
-   the auth file paths reported by the host. **Recommended and default**: in
+   the auth file paths reported by the host. This is the default when those
+   paths are available. In
    container deployments the auth dir is the tree operators volume-mount, so
    state survives CPA image updates and container recreates.
 3. `<OS user config dir>/CLIProxyAPI/codex-auto-reset/state.json` — fallback
@@ -121,6 +164,15 @@ Docker note: with the default auth-dir location, mounting your auth dir (you
 already must, for credentials) is enough, e.g.
 `-v ./cpa/auths:/root/.cli-proxy-api`. No access tokens or credential
 material are persisted in the state file.
+
+For hosts that recursively discover authentication JSON, select a private
+absolute `state_dir` outside the auth directory. Prepare with explicit
+`enabled_accounts: []` and preserve existing reset history and unresolved
+attempts. Saved settings take precedence over YAML settings, except for an
+explicit YAML `state_dir`, and older state can be migrated into a new location.
+Before enabling accounts, inspect the startup state-file location and read
+the management `/status` response's effective `config.enabled_accounts`.
+An empty YAML allowlist alone does not override a saved wildcard allowlist.
 
 ## Installation
 
@@ -254,7 +306,7 @@ make build
 Build and package the release zip:
 
 ```bash
-make package VERSION=0.1.0
+make package VERSION=0.1.14-owner-recovery.2
 ```
 
 Windows users can also use the PowerShell helper:

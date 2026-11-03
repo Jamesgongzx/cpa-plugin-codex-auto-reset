@@ -35,7 +35,7 @@ type rawCredit struct {
 
 type resetCreditsBody struct {
 	Credits        []rawCredit `json:"credits"`
-	AvailableCount int         `json:"available_count"`
+	AvailableCount *int        `json:"available_count"`
 	TotalEarned    int         `json:"total_earned_count"` // accepted, ignored
 }
 
@@ -48,9 +48,14 @@ func parseResetCreditsResponse(raw []byte, now time.Time) (Snapshot, error) {
 	if err := json.Unmarshal(raw, &body); err != nil {
 		return Snapshot{}, fmt.Errorf("parse reset-credits response: %w", err)
 	}
+	if body.Credits == nil || body.AvailableCount == nil || *body.AvailableCount < 0 {
+		return Snapshot{}, fmt.Errorf("parse reset-credits response: missing or invalid credit inventory")
+	}
 	credits := make([]Credit, 0, len(body.Credits))
+	statuses := make(map[string]string, len(body.Credits))
 	for _, rc := range body.Credits {
 		c := Credit{ID: rc.ID, Status: rc.Status}
+		statuses[rc.ID] = rc.Status
 		if rc.ExpiresAt != nil && *rc.ExpiresAt != "" {
 			if t, err := time.Parse(time.RFC3339, *rc.ExpiresAt); err == nil {
 				c.ExpiresAt = t
@@ -60,8 +65,9 @@ func parseResetCreditsResponse(raw []byte, now time.Time) (Snapshot, error) {
 	}
 	credits = availableCreditsSorted(credits, now)
 	return Snapshot{
-		AvailableCount: body.AvailableCount,
+		AvailableCount: *body.AvailableCount,
 		Credits:        credits,
+		CreditStatuses: statuses,
 		WeeklyPct:      -1, // not provided by this endpoint
 		CapturedAt:     now,
 	}, nil
@@ -69,10 +75,12 @@ func parseResetCreditsResponse(raw []byte, now time.Time) (Snapshot, error) {
 
 // parseUsageResponse parses GET /wham/usage using flexible map lookups.
 // The real wire shape (confirmed from live data) is:
-//   "rate_limit": {
-//     "primary_window": {"limit_window_seconds": 604800, "used_percent": 9},
-//     "secondary_window": null
-//   }
+//
+//	"rate_limit": {
+//	  "primary_window": {"limit_window_seconds": 604800, "used_percent": 9},
+//	  "secondary_window": null
+//	}
+//
 // primary_window can be the WEEKLY window (604800s) when there's no
 // secondary. We identify the weekly window by limit_window_seconds ≈ 604800,
 // NOT by position (primary/secondary). code_review_rate_limit may also be
@@ -121,7 +129,7 @@ func parseUsageResponse(raw []byte, now time.Time) (Snapshot, error) {
 		}
 	}
 
-	weeklyPct := 100
+	weeklyPct := -1 // absent or unrecognized weekly evidence is unknown
 	if weeklyUsed >= 0 {
 		weeklyPct = 100 - int(weeklyUsed+0.5)
 		if weeklyPct < 0 {

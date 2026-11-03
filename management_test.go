@@ -349,3 +349,24 @@ func TestPutSettings_EmptyListStillOptsOut(t *testing.T) {
 		t.Fatalf("persisted enabled = %v, want explicit empty", loaded.Config.EnabledAccounts)
 	}
 }
+
+func TestManagement_ImportCannotEraseUnresolvedAttempt(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		name := "pinned_attempt"
+		if legacy {
+			name = "legacy_incomplete_attempt"
+		}
+		t.Run(name, func(t *testing.T) {
+			srv := newTestManagement(t, DefaultConfig(), []string{"acct"})
+			runtime := AccountRuntime{AuthID: "acct", State: StateRECONCILING}
+			if !legacy {
+				runtime.Attempt = ResetAttempt{RedeemRequestID: "original-request", TargetCreditID: "original-credit"}
+			}
+			srv.h.state.Accounts["acct"] = runtime
+			status, _ := srv.h.importState([]byte(`{"config":{"enabled_accounts":[]},"accounts":{}}`))
+			if status != http.StatusConflict || len(srv.h.state.Accounts) != 1 {
+				t.Fatalf("import erased an unresolved attempt: status=%d", status)
+			}
+		})
+	}
+}

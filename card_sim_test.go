@@ -40,7 +40,15 @@ func (c *cardSimClient) Consume(_ CodexCredentials, rrid, cid string) (ConsumeRe
 	return c.consume, nil
 }
 
-func countAvailSim(cs []Credit) int { n := 0; for _, c := range cs { if c.Status == "available" { n++ } }; return n }
+func countAvailSim(cs []Credit) int {
+	n := 0
+	for _, c := range cs {
+		if c.Status == "available" {
+			n++
+		}
+	}
+	return n
+}
 
 type simClock struct{ t time.Time }
 
@@ -70,7 +78,7 @@ func TestCardSimulation_AllStates(t *testing.T) {
 		consume:   ConsumeResponse{Code: ConsumeCodeReset, WindowsReset: 2},
 	}
 	clock := &simClock{t: E.Add(-8 * 24 * time.Hour)}
-	fsm := NewAccountFSM("codex-44411af1-alice@example.com-team.json", CodexCredentials{AccessToken: "tok"}, cfg, fc, clock.Now, logf)
+	fsm := newTestAccountFSM("codex-44411af1-alice@example.com-team.json", CodexCredentials{AccessToken: "tok", SeatFingerprint: "test-seat"}, cfg, fc, clock.Now, logf)
 	stepAndPrintCard(t, fsm, clock, fc, "场景1: 巡查完毕，credit 离过期还远")
 
 	// ============================================================
@@ -81,7 +89,7 @@ func TestCardSimulation_AllStates(t *testing.T) {
 	t.Log("场景 2: ARMED — 进入触发窗口（credit 5h 后过期）")
 	t.Log("========================================")
 	clock.t = E.Add(-5 * time.Hour) // 5h before expiry, within 6h lead time
-	fsm = NewAccountFSM("codex-44411af1-alice@example.com-team.json", CodexCredentials{AccessToken: "tok"}, cfg, fc, clock.Now, logf)
+	fsm = newTestAccountFSM("codex-44411af1-alice@example.com-team.json", CodexCredentials{AccessToken: "tok", SeatFingerprint: "test-seat"}, cfg, fc, clock.Now, logf)
 	stepAndPrintCard(t, fsm, clock, fc, "场景2: 进入 ARMED")
 
 	// ============================================================
@@ -121,7 +129,7 @@ func TestCardSimulation_AllStates(t *testing.T) {
 		consume:   ConsumeResponse{Code: ConsumeCodeNoCredit},
 	}
 	clock3 := &simClock{t: E.Add(-1 * time.Hour)}
-	fsm3 := NewAccountFSM("codex-ac9ce24f-carol@example.com-team.json", CodexCredentials{AccessToken: "tok"}, cfg, fc3, clock3.Now, logf)
+	fsm3 := newTestAccountFSM("codex-ac9ce24f-carol@example.com-team.json", CodexCredentials{AccessToken: "tok", SeatFingerprint: "test-seat"}, cfg, fc3, clock3.Now, logf)
 	fsm3.ForceConfirm()
 	// Drive: CONFIRMING → RESETTING (POST, no_credit) → DONE → Reset → IDLE
 	for i := 0; i < 5 && fsm3.State() != StateIDLE; i++ {
@@ -140,7 +148,7 @@ func TestCardSimulation_AllStates(t *testing.T) {
 		weeklyPct: 100,
 	}
 	clock4 := &simClock{t: time.Date(2026, 7, 18, 22, 0, 0, 0, time.UTC)}
-	fsm4 := NewAccountFSM("codex-fc4bac78-dave@example.com-team.json", CodexCredentials{AccessToken: "tok"}, cfg, fc4, clock4.Now, logf)
+	fsm4 := newTestAccountFSM("codex-fc4bac78-dave@example.com-team.json", CodexCredentials{AccessToken: "tok", SeatFingerprint: "test-seat"}, cfg, fc4, clock4.Now, logf)
 	stepAndPrintCard(t, fsm4, clock4, fc4, "场景6: 无可用次数")
 
 	// ============================================================
@@ -160,7 +168,7 @@ func TestCardSimulation_AllStates(t *testing.T) {
 	// Make Consume always return network error
 	fc5err := &errOnlyClient{credits: fc5.credits, weeklyPct: 40}
 	clock5 := &simClock{t: E.Add(-1 * time.Hour)}
-	fsm5 := NewAccountFSM("codex-fc4bac78-eve@example.com-team.json", CodexCredentials{AccessToken: "tok"}, cfg, fc5err, clock5.Now, logf)
+	fsm5 := newTestAccountFSM("codex-fc4bac78-eve@example.com-team.json", CodexCredentials{AccessToken: "tok", SeatFingerprint: "test-seat"}, cfg, fc5err, clock5.Now, logf)
 	fsm5.ForceConfirm()
 	stepAndPrintCard(t, fsm5, clock5, fc5err, "场景7: 第一次 CONFIRMING→RESETTING")
 	// Drive retries

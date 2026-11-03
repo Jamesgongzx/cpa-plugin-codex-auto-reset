@@ -34,6 +34,9 @@ type AccountFSM struct {
 	Client ResetClient
 	Now    func() time.Time
 	Logf   LogFn
+	// Checkpoint writes this account into the existing plugin state file.
+	// A missing or failed checkpoint must prevent a mutating request.
+	Checkpoint func(AccountRuntime) error
 
 	mu                sync.Mutex
 	state             State
@@ -89,6 +92,83 @@ func (f *AccountFSM) LastSnapshot() Snapshot {
 	return f.lastSnapshot
 }
 
+// Runtime captures the attempt and its scheduling state under one lock.
+func (f *AccountFSM) Runtime() AccountRuntime {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.runtimeLocked()
+}
+
+func (f *AccountFSM) runtimeLocked() AccountRuntime {
+	attempt := f.attempt
+	attempt.PreSnapshot = cloneSnapshot(attempt.PreSnapshot)
+	snapshot := cloneSnapshot(f.lastSnapshot)
+	return AccountRuntime{
+		AuthID: f.AuthID, State: f.state, NextWake: f.nextWake,
+		Attempt: attempt, LastSnapshot: snapshot,
+		ScheduledCreditID: f.scheduledCreditID, ManualReset: f.manualReset,
+	}
+}
+
+func (f *AccountFSM) checkpointLocked() error {
+	if f.Checkpoint == nil {
+		return fmt.Errorf("reset checkpoint unavailable")
+	}
+	return f.Checkpoint(f.runtimeLocked())
+}
+
+// Restore keeps a dispatched request's original target, identity and budget.
+// It reconciles before any same-ID replay, including a crash during dispatch.
+func (f *AccountFSM) Restore(runtime AccountRuntime) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.state, f.nextWake = runtime.State, runtime.NextWake
+	f.attempt, f.lastSnapshot = runtime.Attempt, runtime.LastSnapshot
+	f.scheduledCreditID, f.manualReset = runtime.ScheduledCreditID, runtime.ManualReset
+	if runtime.AuthID != "" && runtime.AuthID != f.AuthID {
+		f.state = StateRECONCILING
+		f.attempt.RetryStopped = true
+	}
+	switch f.state {
+	case StateRESETTING:
+		if f.attempt.Dispatches > 0 || !f.validAttemptLocked() {
+			f.state = StateRECONCILING
+		}
+	case StateVERIFYING:
+		// VERIFYING can also follow a missing target after an ambiguous send.
+		// Only the persisted recognized Consume result establishes acceptance.
+		f.state = StateRECONCILING
+	case StateIDLE, StateARMED, StateCONFIRMING, StateDONE, StateRECONCILING:
+	default:
+		f.state = StateRECONCILING
+		f.attempt.RetryStopped = true
+	}
+	if f.attempt.RedeemRequestID != "" && (f.state == StateIDLE || f.state == StateARMED || f.state == StateCONFIRMING) {
+		f.state = StateRECONCILING
+	}
+	if f.state == StateRECONCILING || f.nextWake.IsZero() {
+		f.nextWake = f.now()
+	}
+}
+
+func (f *AccountFSM) validAttemptLocked() bool {
+	return f.attempt.RedeemRequestID != "" && f.attempt.TargetCreditID != "" && f.attempt.SeatFingerprint != ""
+}
+
+// UpdateCredentials accepts host token renewal for the same pinned seat.
+// A changed or unknown subject leaves the original attempt intact.
+func (f *AccountFSM) UpdateCredentials(creds CodexCredentials, client ResetClient) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.attempt.RedeemRequestID != "" && (f.attempt.SeatFingerprint == "" || creds.SeatFingerprint == "" || creds.SeatFingerprint != f.attempt.SeatFingerprint) {
+		f.state = StateRECONCILING
+		f.nextWake = f.now().Add(credentialRetryInterval)
+		return fmt.Errorf("credential seat changed or is unknown; retaining the original reset attempt")
+	}
+	f.Creds, f.Client = creds, client
+	return nil
+}
+
 // SetNextWake lets external callers (worker's TriggerCheck) override the
 // scheduled wake. Thread-safe.
 func (f *AccountFSM) SetNextWake(t time.Time) {
@@ -102,7 +182,7 @@ func (f *AccountFSM) SetNextWake(t time.Time) {
 func (f *AccountFSM) ForceConfirm() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.state == StateRESETTING || f.state == StateVERIFYING {
+	if f.state == StateRESETTING || f.state == StateVERIFYING || f.state == StateRECONCILING || f.attempt.RedeemRequestID != "" {
 		return
 	}
 	f.scheduledCreditID = ""
@@ -140,6 +220,8 @@ func (f *AccountFSM) stepLocked() time.Time {
 		return f.stepRESETTING()
 	case StateVERIFYING:
 		return f.stepVERIFYING()
+	case StateRECONCILING:
+		return f.stepRECONCILING()
 	case StateDONE:
 		return time.Time{}
 	}
@@ -165,6 +247,14 @@ func (f *AccountFSM) StepAndSettle() time.Time {
 		f.testPostStep() // test-only interleaving hook; mu is still held
 	}
 	if wake.IsZero() && f.state == StateDONE {
+		if f.attempt.RedeemRequestID != "" {
+			if err := f.checkpointLocked(); err != nil {
+				wake = f.now().Add(credentialRetryInterval)
+				f.log("error", "completed attempt checkpoint failed: "+err.Error(), "retry checkpoint before another cycle", &wake, nil)
+				f.nextWake = wake
+				return wake
+			}
+		}
 		f.resetLocked()
 		wake = f.now().Add(f.Cfg.RefreshInterval)
 	}
@@ -183,7 +273,9 @@ func (f *AccountFSM) now() time.Time {
 func (f *AccountFSM) triggerTime(c Credit) time.Time { return c.ExpiresAt.Add(-f.Cfg.TriggerLeadTime) }
 
 // armThreshold returns M = T - R (the moment we enter ARMED).
-func (f *AccountFSM) armThreshold(c Credit) time.Time { return f.triggerTime(c).Add(-f.Cfg.RefreshInterval) }
+func (f *AccountFSM) armThreshold(c Credit) time.Time {
+	return f.triggerTime(c).Add(-f.Cfg.RefreshInterval)
+}
 
 func (f *AccountFSM) log(level, msg, nextAction string, nextAt *time.Time, details map[string]any) {
 	if f.Logf != nil {
@@ -309,6 +401,16 @@ func (f *AccountFSM) stepCONFIRMING() time.Time {
 		f.log("error", fmt.Sprintf("confirm usage failed: %v", err), "abandon", nil, nil)
 		return time.Time{}
 	}
+	if !f.manualReset && usage.WeeklyPct < 0 {
+		f.state = StateDONE
+		f.log("warn", "weekly quota is unknown; automatic reset not authorized", "retry patrol", nil, nil)
+		return time.Time{}
+	}
+	if f.Creds.SeatFingerprint == "" {
+		f.state = StateDONE
+		f.log("error", "credential seat is unknown; reset not authorized", "reload credentials on next patrol", nil, nil)
+		return time.Time{}
+	}
 	snap.WeeklyPct = usage.WeeklyPct
 	f.attempt = ResetAttempt{
 		RedeemRequestID: uuid.NewString(),
@@ -316,6 +418,7 @@ func (f *AccountFSM) stepCONFIRMING() time.Time {
 		PreSnapshot:     snap,
 		StartedAt:       now,
 		Attempt:         0,
+		SeatFingerprint: f.Creds.SeatFingerprint,
 	}
 	f.state = StateRESETTING
 	f.log("info",
@@ -323,20 +426,62 @@ func (f *AccountFSM) stepCONFIRMING() time.Time {
 			shortID(target.ID), snap.AvailableCount, snap.WeeklyPct),
 		"send reset request", nil,
 		map[string]any{
-			"credit_id":           target.ID,
-			"pre_credits":         snap.AvailableCount,
-			"pre_weekly_pct":      snap.WeeklyPct,
-			"target_expires_at":   target.ExpiresAt,
-			"redeem_request_id":   f.attempt.RedeemRequestID,
+			"credit_id":         target.ID,
+			"pre_credits":       snap.AvailableCount,
+			"pre_weekly_pct":    snap.WeeklyPct,
+			"target_expires_at": target.ExpiresAt,
+			"redeem_request_id": f.attempt.RedeemRequestID,
 		})
 	return f.now()
 }
 
 func (f *AccountFSM) stepRESETTING() time.Time {
 	now := f.now()
+	if !f.validAttemptLocked() || f.Creds.SeatFingerprint != f.attempt.SeatFingerprint {
+		return f.holdLocked("reset identity is missing or changed; retaining the original attempt")
+	}
+	if f.attempt.Accepted {
+		f.state = StateVERIFYING
+		return now
+	}
+	if f.attempt.RetryStopped || f.attempt.Dispatches >= 1+len(resetRetryDelays) {
+		return f.holdLocked("reset retry budget stopped; reconciliation only")
+	}
+	if now.Before(f.attempt.NextRetryAt) {
+		return f.attempt.NextRetryAt
+	}
+	credits, err := f.Client.ListCredits(f.Creds)
+	if err != nil {
+		return f.holdLocked("pre-dispatch credit check failed: " + err.Error())
+	}
+	if !f.targetAvailableLocked(credits) {
+		if f.attempt.Dispatches == 0 {
+			f.state = StateDONE
+			f.log("warn", "pinned credit unavailable before first dispatch", "abandon unsent attempt", nil, nil)
+			return time.Time{}
+		}
+		f.state = StateVERIFYING
+		return now
+	}
+	// Checkpoint the actual send count before the POST. A process restart
+	// cannot turn a sent initial request or retry into a fresh budget.
+	previousRetryAt := f.attempt.NextRetryAt
+	f.attempt.Dispatches++
+	// Save the earliest next replay time before an unknown response can be
+	// lost. Reconciliation may read sooner, but cannot bypass this backoff.
+	f.attempt.NextRetryAt = now.Add(backoffForAttempt(f.attempt.Dispatches))
+	f.nextWake = now
+	if err := f.checkpointLocked(); err != nil {
+		f.attempt.Dispatches--
+		f.attempt.NextRetryAt = previousRetryAt
+		next := now.Add(credentialRetryInterval)
+		f.log("error", "reset checkpoint failed: "+err.Error(), "retry checkpoint without dispatch", &next, nil)
+		return next
+	}
 	resp, err := f.Client.Consume(f.Creds, f.attempt.RedeemRequestID, f.attempt.TargetCreditID)
 	switch classifyConsume(resp, err) {
 	case decisionSuccess:
+		f.attempt.Accepted = true
 		f.state = StateVERIFYING
 		f.verifyDue = now.Add(postResetVerifyDelay)
 		f.nextWake = f.verifyDue
@@ -352,6 +497,11 @@ func (f *AccountFSM) stepRESETTING() time.Time {
 			})
 		return f.verifyDue
 	case decisionStop:
+		knownRejection := err == nil && (resp.Code == ConsumeCodeNoCredit || resp.Code == ConsumeCodeNothingToReset) || IsClientError(err)
+		if !knownRejection || f.attempt.Dispatches > 1 {
+			f.attempt.RetryStopped = true
+			return f.holdLocked("consume outcome unresolved; retaining the original credit and request ID")
+		}
 		f.state = StateDONE
 		msg := fmt.Sprintf("reset stopped: server returned %s", resp.Code)
 		if err != nil {
@@ -360,14 +510,10 @@ func (f *AccountFSM) stepRESETTING() time.Time {
 		f.log("warn", msg, "abandon", nil, map[string]any{"redeem_request_id": f.attempt.RedeemRequestID})
 		return time.Time{}
 	case decisionRetry:
-		f.attempt.Attempt++
-		if f.attempt.Attempt > len(resetRetryDelays) {
-			f.state = StateDONE
-			f.log("error",
-				fmt.Sprintf("retries exhausted after %d attempts; last error: %v", f.attempt.Attempt-1, err),
-				"abandon", nil,
-				map[string]any{"redeem_request_id": f.attempt.RedeemRequestID})
-			return time.Time{}
+		f.attempt.Attempt = f.attempt.Dispatches
+		if f.attempt.Dispatches >= 1+len(resetRetryDelays) {
+			f.attempt.RetryStopped = true
+			return f.holdLocked(fmt.Sprintf("retries exhausted after %d sends; outcome unresolved", f.attempt.Dispatches))
 		}
 		backoff := backoffForAttempt(f.attempt.Attempt)
 		f.attempt.NextRetryAt = now.Add(backoff)
@@ -384,23 +530,70 @@ func (f *AccountFSM) stepRESETTING() time.Time {
 func (f *AccountFSM) stepVERIFYING() time.Time {
 	credits, err := f.Client.ListCredits(f.Creds)
 	if err != nil {
-		f.state = StateDONE
-		f.log("error", fmt.Sprintf("verification failed: %v", err), "abandon", nil,
-			map[string]any{"redeem_request_id": f.attempt.RedeemRequestID, "target_credit_id": f.attempt.TargetCreditID})
-		return time.Time{}
+		return f.holdLocked("verification credit check failed: " + err.Error())
 	}
+	return f.verifySnapshotLocked(credits, true)
+}
+
+// Reconciliation never selects a credit. A replay is permitted only by the
+// existing same-request, same-credit idempotent protocol and original budget.
+// Inventory presence alone is not proof that the previous POST had no effect.
+func (f *AccountFSM) stepRECONCILING() time.Time {
+	if !f.validAttemptLocked() || f.Creds.SeatFingerprint != f.attempt.SeatFingerprint {
+		return f.holdLocked("cannot reconcile an incomplete attempt or unknown credential seat")
+	}
+	credits, err := f.Client.ListCredits(f.Creds)
+	if err != nil {
+		return f.holdLocked("reconciliation credit check failed: " + err.Error())
+	}
+	if !f.targetAvailableLocked(credits) {
+		f.attempt.RetryStopped = true
+		return f.verifySnapshotLocked(credits, false)
+	}
+	if f.attempt.Accepted || f.attempt.RetryStopped || f.attempt.Dispatches >= 1+len(resetRetryDelays) {
+		return f.holdLocked("original credit still available; waiting for authoritative reset evidence")
+	}
+	f.state = StateRESETTING
+	wake := f.now()
+	if f.attempt.NextRetryAt.After(wake) {
+		wake = f.attempt.NextRetryAt
+	}
+	f.log("warn", "reconciled pinned target; continuing the original same-ID retry protocol", "retry original request", &wake, nil)
+	return wake
+}
+
+func (f *AccountFSM) targetAvailableLocked(snapshot Snapshot) bool {
+	for _, credit := range availableCreditsSorted(snapshot.Credits, f.now()) {
+		if credit.ID == f.attempt.TargetCreditID {
+			return true
+		}
+	}
+	return false
+}
+
+func (f *AccountFSM) holdLocked(message string) time.Time {
+	f.state = StateRECONCILING
+	next := f.now().Add(f.Cfg.RefreshInterval)
+	f.log("warn", message, "reconcile original attempt; no replacement credit", &next,
+		map[string]any{"redeem_request_id": f.attempt.RedeemRequestID, "credit_id": f.attempt.TargetCreditID})
+	return next
+}
+
+func (f *AccountFSM) verifySnapshotLocked(credits Snapshot, recordFailure bool) time.Time {
 	usage, err := f.Client.GetUsage(f.Creds)
 	if err != nil {
-		f.state = StateDONE
-		f.log("error", fmt.Sprintf("verification failed: %v", err), "abandon", nil,
-			map[string]any{"redeem_request_id": f.attempt.RedeemRequestID, "target_credit_id": f.attempt.TargetCreditID})
-		return time.Time{}
+		return f.holdLocked("verification usage check failed: " + err.Error())
 	}
 	// Update lastSnapshot with post-reset data so the UI shows the new state.
 	credits.WeeklyPct = usage.WeeklyPct
 	f.lastSnapshot = credits
 
-	// Triple deduction check (spec §4.3 invariant 3).
+	// Consumption evidence is separate from quota evidence. Expiry, omission
+	// or a count change cannot establish that an ambiguous POST consumed the
+	// target. A recognized response for this attempt or the exact target's
+	// returned redeemed status is required under the upstream protocol.
+	targetStatus := credits.CreditStatuses[f.attempt.TargetCreditID]
+	consumptionKnown := f.attempt.Accepted || targetStatus == "redeemed"
 	targetGone := true
 	for _, c := range credits.Credits {
 		if c.ID == f.attempt.TargetCreditID && c.Status == "available" {
@@ -409,23 +602,32 @@ func (f *AccountFSM) stepVERIFYING() time.Time {
 		}
 	}
 	countDown1 := credits.AvailableCount == f.attempt.PreSnapshot.AvailableCount-1
-	quotaUp := usage.WeeklyPct >= 100 || usage.WeeklyPct > f.attempt.PreSnapshot.WeeklyPct
+	weeklyIncreased := f.attempt.PreSnapshot.WeeklyPct >= 0 && usage.WeeklyPct > f.attempt.PreSnapshot.WeeklyPct
+	quotaUp := usage.WeeklyPct >= 0 && (usage.WeeklyPct >= 100 || weeklyIncreased)
 
 	f.state = StateDONE
 	// Build detailed details map with full before/after snapshot.
 	details := map[string]any{
-		"credit_id":            f.attempt.TargetCreditID,
-		"redeem_request_id":    f.attempt.RedeemRequestID,
-		"pre_credits":          f.attempt.PreSnapshot.AvailableCount,
-		"post_credits":         credits.AvailableCount,
-		"pre_weekly_pct":       f.attempt.PreSnapshot.WeeklyPct,
-		"post_weekly_pct":      usage.WeeklyPct,
-		"target_gone":          targetGone,
-		"count_down_1":         countDown1,
-		"quota_recovered":      quotaUp,
+		"credit_id":         f.attempt.TargetCreditID,
+		"redeem_request_id": f.attempt.RedeemRequestID,
+		"pre_credits":       f.attempt.PreSnapshot.AvailableCount,
+		"post_credits":      credits.AvailableCount,
+		"pre_weekly_pct":    f.attempt.PreSnapshot.WeeklyPct,
+		"post_weekly_pct":   usage.WeeklyPct,
+		"target_gone":       targetGone,
+		"target_status":     targetStatus,
+		"consume_accepted":  f.attempt.Accepted,
+		"consumption_known": consumptionKnown,
+		"count_down_1":      countDown1,
+		"quota_recovered":   quotaUp,
+		"weekly_increased":  weeklyIncreased,
 	}
 
-	success := targetGone && countDown1 && quotaUp
+	success := consumptionKnown && targetGone && countDown1 && quotaUp
+	if !success {
+		f.state = StateRECONCILING
+		f.attempt.RetryStopped = true
+	}
 
 	switch {
 	case success:
@@ -435,32 +637,39 @@ func (f *AccountFSM) stepVERIFYING() time.Time {
 				f.attempt.PreSnapshot.WeeklyPct, usage.WeeklyPct,
 				shortID(f.attempt.TargetCreditID)),
 			"cycle complete", nil, details)
+	case !consumptionKnown:
+		f.log("warn", fmt.Sprintf("consume outcome unresolved: target status=%q; disappearance or expiry does not establish redemption", targetStatus),
+			"reconcile original attempt", nil, details)
 	case targetGone && countDown1:
 		f.log("warn",
 			fmt.Sprintf("reset PARTIAL: credits %d→%d ok but weekly %d%%→%d%% (delayed recovery?)",
 				f.attempt.PreSnapshot.AvailableCount, credits.AvailableCount,
 				f.attempt.PreSnapshot.WeeklyPct, usage.WeeklyPct),
-			"cycle complete", nil, details)
+			"reconcile original attempt", nil, details)
 	default:
 		f.log("error",
-			fmt.Sprintf("reset MISMATCH: target_gone=%v count_down_1=%v quota_recovered=%v — halted, no compensating request",
+			fmt.Sprintf("reset MISMATCH: target_gone=%v count_down_1=%v quota_recovered=%v; retaining the original attempt",
 				targetGone, countDown1, quotaUp),
-			"abandon", nil, details)
+			"reconcile original attempt", nil, details)
 	}
 
 	// Capture the reset result for history. NOT cleared by Reset().
-	f.pendingHistory = &ResetRecord{
-		Timestamp:     f.now(),
-		AuthID:        f.AuthID,
-		CreditID:      f.attempt.TargetCreditID,
-		Success:       success,
-		PreWeeklyPct:  f.attempt.PreSnapshot.WeeklyPct,
-		PostWeeklyPct: usage.WeeklyPct,
-		PreCredits:    f.attempt.PreSnapshot.AvailableCount,
-		PostCredits:   credits.AvailableCount,
+	if success || recordFailure {
+		f.pendingHistory = &ResetRecord{
+			Timestamp:     f.now(),
+			AuthID:        f.AuthID,
+			CreditID:      f.attempt.TargetCreditID,
+			Success:       success,
+			PreWeeklyPct:  f.attempt.PreSnapshot.WeeklyPct,
+			PostWeeklyPct: usage.WeeklyPct,
+			PreCredits:    f.attempt.PreSnapshot.AvailableCount,
+			PostCredits:   credits.AvailableCount,
+		}
 	}
-
-	return time.Time{}
+	if success {
+		return time.Time{}
+	}
+	return f.now().Add(f.Cfg.RefreshInterval)
 }
 
 // Reset returns a DONE FSM to IDLE for the next patrol cycle. Called by the
@@ -469,6 +678,11 @@ func (f *AccountFSM) stepVERIFYING() time.Time {
 func (f *AccountFSM) Reset() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.attempt.RedeemRequestID != "" {
+		if f.state != StateDONE || f.checkpointLocked() != nil {
+			return
+		}
+	}
 	f.resetLocked()
 }
 

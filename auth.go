@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -15,6 +16,7 @@ type CodexCredentials struct {
 	IDToken          string
 	ChatGPTAccountID string
 	ExpiresAt        time.Time
+	SeatFingerprint  string
 }
 
 func ExtractCodexCredentials(raw json.RawMessage) (CodexCredentials, error) {
@@ -49,7 +51,37 @@ func ExtractCodexCredentials(raw json.RawMessage) (CodexCredentials, error) {
 		IDToken:          idToken,
 		ChatGPTAccountID: accountID,
 		ExpiresAt:        expiresAt,
+		SeatFingerprint:  credentialSeatFingerprint(accessToken, idToken, accountID),
 	}, nil
+}
+
+// credentialSeatFingerprint binds the actual bearer subject to its workspace.
+// It introspects host-owned tokens, without taking over validation or refresh.
+// An opaque bearer, missing subject, or conflicting claim cannot authorize a
+// reset. Account index, email and workspace alone do not identify a user seat.
+func credentialSeatFingerprint(accessToken, idToken, accountID string) string {
+	claims, err := decodeJWTClaims(accessToken)
+	if err != nil || accountID == "" {
+		return ""
+	}
+	subject, _ := stringFromMap(claims, "sub")
+	workspace, err := extractChatGPTAccountID(accessToken)
+	if subject == "" || err != nil || workspace != accountID {
+		return ""
+	}
+	if idToken != "" {
+		idClaims, err := decodeJWTClaims(idToken)
+		if err != nil {
+			return ""
+		}
+		if idSubject, ok := stringFromMap(idClaims, "sub"); ok && idSubject != subject {
+			return ""
+		}
+		if idWorkspace, err := extractChatGPTAccountID(idToken); err == nil && idWorkspace != workspace {
+			return ""
+		}
+	}
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(workspace+"\x00"+subject)))
 }
 
 func extractChatGPTAccountID(idToken string) (string, error) {

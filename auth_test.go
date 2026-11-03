@@ -65,3 +65,53 @@ func TestExtractCodexCredentialsRejectsMissingAccessToken(t *testing.T) {
 		t.Fatalf("ExtractCodexCredentials accepted missing access token")
 	}
 }
+
+func testSeatCredentials(t *testing.T, subject, workspace, tokenID string) CodexCredentials {
+	t.Helper()
+	token := makeUnsignedJWT(t, map[string]any{
+		"sub": subject, "jti": tokenID,
+		"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": workspace},
+	})
+	raw, err := json.Marshal(map[string]string{"access_token": token, "id_token": token, "account_id": workspace})
+	if err != nil {
+		t.Fatal(err)
+	}
+	creds, err := ExtractCodexCredentials(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return creds
+}
+
+func TestCredentialSeatFingerprint_StableAcrossTokenRotation(t *testing.T) {
+	first := testSeatCredentials(t, "user-one", "workspace", "token-one")
+	rotated := testSeatCredentials(t, "user-one", "workspace", "token-two")
+	otherUser := testSeatCredentials(t, "user-two", "workspace", "token-three")
+	otherWorkspace := testSeatCredentials(t, "user-one", "other-workspace", "token-four")
+	if first.SeatFingerprint == "" || first.SeatFingerprint != rotated.SeatFingerprint {
+		t.Fatal("same subject and workspace did not retain their identity across token rotation")
+	}
+	if first.SeatFingerprint == otherUser.SeatFingerprint || first.SeatFingerprint == otherWorkspace.SeatFingerprint {
+		t.Fatal("different user or workspace shared a seat fingerprint")
+	}
+}
+
+func TestCredentialSeatFingerprint_RejectsUnknownOrConflictingClaims(t *testing.T) {
+	access := testSeatCredentials(t, "user-one", "workspace", "access")
+	other := testSeatCredentials(t, "user-two", "workspace", "other")
+	missingSubject := makeUnsignedJWT(t, map[string]any{
+		"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "workspace"},
+	})
+	for _, tc := range []struct{ name, access, id, workspace string }{
+		{"opaque_bearer", "opaque", access.IDToken, "workspace"},
+		{"missing_subject", missingSubject, "", "workspace"},
+		{"changed_workspace", access.AccessToken, access.IDToken, "other-workspace"},
+		{"conflicting_subject", access.AccessToken, other.IDToken, "workspace"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if credentialSeatFingerprint(tc.access, tc.id, tc.workspace) != "" {
+				t.Fatal("unknown or conflicting bearer identity authorized a seat")
+			}
+		})
+	}
+}

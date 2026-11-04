@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sync"
 	"time"
 )
 
@@ -22,27 +21,19 @@ type PluginState struct {
 }
 
 // AccountRuntime is the persisted per-account FSM snapshot. Only the fields
-// needed to resume scheduling and reconcile an in-flight attempt are stored.
+// needed to resume scheduling are stored; transient step state is not.
 type AccountRuntime struct {
-	AuthID            string       `json:"auth_id"`
-	State             State        `json:"state"`
-	NextWake          time.Time    `json:"next_wake"`
-	Attempt           ResetAttempt `json:"attempt,omitempty"`
-	LastSnapshot      Snapshot     `json:"last_snapshot,omitempty"`
-	ScheduledCreditID string       `json:"scheduled_credit_id,omitempty"`
-	ManualReset       bool         `json:"manual_reset,omitempty"`
+	AuthID       string       `json:"auth_id"`
+	State        State        `json:"state"`
+	NextWake     time.Time    `json:"next_wake"`
+	Attempt      ResetAttempt `json:"attempt,omitempty"`
+	LastSnapshot Snapshot     `json:"last_snapshot,omitempty"`
 }
-
-// All existing save paths use the same temporary filename. Serialize them,
-// including management saves, so a checkpoint cannot be replaced mid-write.
-var stateFileMu sync.Mutex
 
 // saveState writes state atomically: marshal → write to <path>.tmp → rename.
 // The tmp+rename pattern ensures a crash mid-write leaves the prior file
 // intact rather than a truncated one.
 func saveState(path string, s *PluginState) error {
-	stateFileMu.Lock()
-	defer stateFileMu.Unlock()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
@@ -51,19 +42,7 @@ func saveState(path string, s *PluginState) error {
 		return err
 	}
 	tmp := path + ".tmp"
-	file, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
-	if err != nil {
-		return err
-	}
-	if _, err := file.Write(raw); err != nil {
-		_ = file.Close()
-		return err
-	}
-	if err := file.Sync(); err != nil {
-		_ = file.Close()
-		return err
-	}
-	if err := file.Close(); err != nil {
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
 		return err
 	}
 	return os.Rename(tmp, path)

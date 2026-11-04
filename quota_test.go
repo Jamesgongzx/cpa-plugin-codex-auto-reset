@@ -34,39 +34,6 @@ func TestParseResetCreditsResponse_UpstreamContractFixture(t *testing.T) {
 	}
 }
 
-func TestParseResetCreditsResponse_UnknownInventoryIsNotAnEmptyBank(t *testing.T) {
-	for _, raw := range []string{`{}`, `{"credits":[]}`, `{"available_count":0}`, `{"credits":null,"available_count":0}`} {
-		if _, err := parseResetCreditsResponse([]byte(raw), time.Now()); err == nil {
-			t.Fatalf("unknown inventory was accepted as an empty bank: %s", raw)
-		}
-	}
-}
-
-func TestParseResetCreditsResponse_PreservesExactStatusesOutsideCandidates(t *testing.T) {
-	raw := []byte(`{"credits":[
-	  {"id":"redeemed","status":"redeemed","expires_at":"2026-11-02T00:00:00Z"},
-	  {"id":"expired","status":"expired","expires_at":"2026-11-02T00:00:00Z"},
-	  {"id":"unknown","status":"processing","expires_at":null},
-	  {"id":"candidate","status":"available","expires_at":null}
-	],"available_count":1}`)
-	now := time.Date(2026, 11, 3, 0, 0, 0, 0, time.UTC)
-	snapshot, err := parseResetCreditsResponse(raw, now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(snapshot.Credits) != 1 || snapshot.Credits[0].ID != "candidate" {
-		t.Fatal("raw evidence changed the available-credit candidate filter")
-	}
-	for id, want := range map[string]string{"redeemed": "redeemed", "expired": "expired", "unknown": "processing", "candidate": "available"} {
-		if snapshot.CreditStatuses[id] != want {
-			t.Fatalf("raw status for %s = %q, want %q", id, snapshot.CreditStatuses[id], want)
-		}
-	}
-	if _, exists := snapshot.CreditStatuses["missing"]; exists {
-		t.Fatal("absent target acquired an inferred status")
-	}
-}
-
 func TestParseUsageResponse_WeeklyPercent(t *testing.T) {
 	// Real /wham/usage shape (confirmed from live data): primary_window IS
 	// the weekly window (limit_window_seconds=604800), secondary is null.
@@ -110,8 +77,8 @@ func TestParseUsageResponse_PrimaryIsFiveHour(t *testing.T) {
 	}
 }
 
-func TestParseUsageResponse_NoWeeklyWindowIsUnknown(t *testing.T) {
-	// A five-hour window is not evidence of weekly capacity.
+func TestParseUsageResponse_NoWeeklyWindowDefaultsFull(t *testing.T) {
+	// Only a 5-hour window, no weekly (604800s) -> treat as full (100%).
 	raw := []byte(`{
 	  "rate_limit":{
 	    "primary_window":{"used_percent":99,"limit_window_seconds":18000}
@@ -121,33 +88,19 @@ func TestParseUsageResponse_NoWeeklyWindowIsUnknown(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	if snap.WeeklyPct != -1 {
-		t.Fatalf("WeeklyPct = %d, want unknown when no weekly window", snap.WeeklyPct)
+	if snap.WeeklyPct != 100 {
+		t.Fatalf("WeeklyPct = %d, want 100 when no weekly window", snap.WeeklyPct)
 	}
 }
 
-func TestParseUsageResponse_NoRateLimitIsUnknown(t *testing.T) {
+func TestParseUsageResponse_NoRateLimitDefaultsFull(t *testing.T) {
 	raw := []byte(`{"plan_type":"plus"}`)
 	snap, err := parseUsageResponse(raw, time.Now())
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	if snap.WeeklyPct != -1 {
-		t.Fatalf("WeeklyPct = %d, want unknown when no rate-limit block", snap.WeeklyPct)
-	}
-}
-
-func TestParseUsageResponse_MalformedWeeklyWindowIsUnknown(t *testing.T) {
-	for _, raw := range []string{
-		`{"rate_limit":{"primary_window":{"limit_window_seconds":604800}}}`,
-		`{"rate_limit":{"primary_window":{"limit_window_seconds":604800,"used_percent":"unknown"}}}`,
-		`{"rate_limit":{"primary_window":{"limit_window_seconds":604800,"used_percent":-1}}}`,
-		`{"rate_limit":{"primary_window":{"used_percent":0}}}`,
-	} {
-		snapshot, err := parseUsageResponse([]byte(raw), time.Now())
-		if err != nil || snapshot.WeeklyPct != -1 {
-			t.Fatalf("malformed weekly evidence became known: snapshot=%+v error=%v", snapshot, err)
-		}
+	if snap.WeeklyPct != 100 {
+		t.Fatalf("WeeklyPct = %d, want 100 when no rate-limit block", snap.WeeklyPct)
 	}
 }
 

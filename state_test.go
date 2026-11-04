@@ -3,37 +3,10 @@ package main
 import (
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
 )
-
-func TestState_ActiveAttemptRoundTrip(t *testing.T) {
-	stamp := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
-	want := AccountRuntime{
-		AuthID: "acct", State: StateVERIFYING, NextWake: stamp,
-		ScheduledCreditID: "credit", ManualReset: true,
-		Attempt: ResetAttempt{
-			RedeemRequestID: "request", TargetCreditID: "credit", SeatFingerprint: "seat",
-			Dispatches: 3, Attempt: 2, Accepted: true, RetryStopped: true,
-			StartedAt: stamp.Add(-time.Hour), NextRetryAt: stamp,
-			PreSnapshot: Snapshot{AvailableCount: 2, WeeklyPct: 25, CapturedAt: stamp, Credits: []Credit{{ID: "credit", Status: "available"}}, CreditStatuses: map[string]string{"credit": "available"}},
-		},
-		LastSnapshot: Snapshot{AvailableCount: 1, WeeklyPct: -1, CapturedAt: stamp, CreditStatuses: map[string]string{"credit": "redeemed"}},
-	}
-	path := filepath.Join(t.TempDir(), "state.json")
-	if err := saveState(path, &PluginState{Accounts: map[string]AccountRuntime{"acct": want}}); err != nil {
-		t.Fatal(err)
-	}
-	loaded, _, err := loadState(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := loaded.Accounts["acct"]; !reflect.DeepEqual(got, want) {
-		t.Fatalf("attempt round-trip differs: got=%+v want=%+v", got, want)
-	}
-}
 
 func TestState_SaveLoadRoundTrip(t *testing.T) {
 	dir := t.TempDir()

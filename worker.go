@@ -46,16 +46,11 @@ type Worker struct {
 	// PluginState for the management UI and crash recovery. Called inline
 	// from the worker goroutine.
 	StateSync func(authID string, fsm *AccountFSM)
-	// InitialAccounts is an immutable copy of the existing persisted state.
-	// Checkpoint is synchronous and must succeed before any consume request.
-	InitialAccounts map[string]AccountRuntime
-	Checkpoint      func(AccountRuntime) error
 
 	mu      sync.Mutex
 	fsms    map[string]*AccountFSM
 	logs    *logRing
 	stopCh  chan struct{}
-	doneCh  chan struct{}
 	wakeCh  chan struct{} // wakes the sleeping loop when a manual trigger changes nextWake
 	stopped bool
 
@@ -92,7 +87,7 @@ func NewWorker(cfg Config, enabled []string, loader CredsLoader, nowFn func() ti
 		cfg: cfg, enabled: enabled, resolvedEnabled: static, loader: loader, nowFn: nowFn,
 		fsms: map[string]*AccountFSM{}, missingRetryAt: map[string]time.Time{},
 		logs:   newLogRing(maxLogEntries),
-		stopCh: make(chan struct{}), doneCh: make(chan struct{}), wakeCh: make(chan struct{}, 1),
+		stopCh: make(chan struct{}), wakeCh: make(chan struct{}, 1),
 	}
 }
 
@@ -148,14 +143,6 @@ func (w *Worker) Stop() {
 	w.stopped = true
 	close(w.stopCh)
 	w.mu.Unlock()
-}
-
-// StopAndWait joins a scheduled Run, including its final state sync. Callers
-// must not hold the state mutex needed by that sync. Stop stays non-blocking
-// so callbacks within Run can request termination without joining themselves.
-func (w *Worker) StopAndWait() {
-	w.Stop()
-	<-w.doneCh
 }
 
 // TriggerCheck pulls IDLE accounts to an immediate patrol (nextWake=now,
@@ -218,7 +205,6 @@ func (w *Worker) ForceConfirm(authID string) error {
 // accounts forever. The panicking account gets its nextWake pushed forward
 // and the loop continues.
 func (w *Worker) Run() {
-	defer close(w.doneCh)
 	defer func() {
 		if r := recover(); r != nil {
 			// This should never happen — the inner recover should catch per-account
@@ -229,15 +215,7 @@ func (w *Worker) Run() {
 				Message: fmt.Sprintf("worker Run() panic (outer): %v", r),
 			})
 		}
-		if w.StateSync != nil {
-			w.EachFSM(func(fsm *AccountFSM) { w.StateSync(fsm.AuthID, fsm) })
-		}
 	}()
-	select {
-	case <-w.stopCh:
-		return
-	default:
-	}
 
 	// ensureFSM takes the worker mutex itself, so don't hold it here.
 	for _, id := range w.resolvedEnabled {
@@ -313,9 +291,6 @@ func (w *Worker) stepAccountSafe(authID string) {
 		w.ensureFSM(authID)
 		return
 	}
-	if w.StateSync != nil {
-		defer w.StateSync(authID, fsm)
-	}
 
 	// Refresh credentials before stepping.
 	creds, client, err := w.loader(authID)
@@ -330,18 +305,12 @@ func (w *Worker) stepAccountSafe(authID string) {
 		return
 	}
 
-	if err := fsm.UpdateCredentials(creds, client); err != nil {
-		w.logs.append(LogEntry{
-			Timestamp: w.nowFn(), Level: "error", Scope: authID,
-			State: fsm.State(), Message: err.Error(), NextAction: "wait for the original credential seat",
-		})
-		return
-	}
-	select {
-	case <-w.stopCh:
-		return
-	default:
-	}
+	// Set credentials and client under the FSM mutex to avoid data races
+	// with concurrent State()/NextWake() readers.
+	fsm.mu.Lock()
+	fsm.Creds = creds
+	fsm.Client = client
+	fsm.mu.Unlock()
 
 	// Atomic tick + DONE settle: the DONE→IDLE reset and the nextWake write
 	// happen under one FSM mutex hold, so a concurrent ForceConfirm/TriggerCheck
@@ -349,6 +318,10 @@ func (w *Worker) stepAccountSafe(authID string) {
 	// would strand the FSM — soonest() skips zero wakes forever).
 	fsm.StepAndSettle()
 
+	// Mirror FSM state into the persisted PluginState.
+	if w.StateSync != nil {
+		w.StateSync(authID, fsm)
+	}
 }
 
 func (w *Worker) ensureFSM(id string) {
@@ -372,14 +345,9 @@ func (w *Worker) ensureFSM(id string) {
 		return
 	}
 	fsm := NewAccountFSM(id, creds, w.cfg, client, w.nowFn, w.makeLogFn(id))
-	fsm.Checkpoint = w.Checkpoint
 	// Seed nextWake=now so the very first loop tick steps this FSM. Without
 	// this, a fresh FSM has zero nextWake and soonest() skips it forever.
-	if runtime, ok := w.InitialAccounts[id]; ok {
-		fsm.Restore(runtime)
-	} else {
-		fsm.SetNextWake(w.nowFn())
-	}
+	fsm.SetNextWake(w.nowFn())
 	w.mu.Lock()
 	if _, ok := w.fsms[id]; !ok {
 		w.fsms[id] = fsm

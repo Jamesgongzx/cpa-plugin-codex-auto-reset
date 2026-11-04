@@ -29,7 +29,7 @@ type AccountOption struct {
 // routes from spec §9. The HTML resource page (Task 12) is rendered by
 // renderStatusHTML, called from the resource/status route.
 type managementHandlers struct {
-	mu                *sync.Mutex
+	mu                sync.Mutex
 	state             *PluginState
 	statePath         string
 	worker            *Worker
@@ -37,18 +37,8 @@ type managementHandlers struct {
 	OnSettingsChanged func()        // injected by main.go; restarts the worker with new config
 }
 
-func newManagementHandlers(state *PluginState, statePath string, worker *Worker, stateMutex ...*sync.Mutex) *managementHandlers {
-	mu := new(sync.Mutex)
-	if len(stateMutex) > 0 {
-		mu = stateMutex[0]
-	}
-	return &managementHandlers{mu: mu, state: state, statePath: statePath, worker: worker}
-}
-
-func (h *managementHandlers) currentWorker() *Worker {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.worker
+func newManagementHandlers(state *PluginState, statePath string, worker *Worker) *managementHandlers {
+	return &managementHandlers{state: state, statePath: statePath, worker: worker}
 }
 
 // resourceBasePath is the URL prefix under which CPA serves browser-navigable
@@ -82,7 +72,7 @@ func (h *managementHandlers) handle(method, rawPath string, headers http.Header,
 	case method == http.MethodGet && path == "/status":
 		// Same path serves HTML (resource load) or JSON (management API).
 		if isResourcePath(rawPath) {
-			return http.StatusOK, []byte(renderStatusHTML(nil)), "text/html; charset=utf-8"
+			return http.StatusOK, []byte(renderStatusHTML(h.state)), "text/html; charset=utf-8"
 		}
 		st, b := h.statusJSON()
 		return st, b, "application/json"
@@ -103,8 +93,8 @@ func (h *managementHandlers) handle(method, rawPath string, headers http.Header,
 		st, b := h.checkOne(body)
 		return st, b, "application/json"
 	case method == http.MethodPost && path == "/check/all":
-		if worker := h.currentWorker(); worker != nil {
-			if err := worker.TriggerCheck(""); err != nil {
+		if h.worker != nil {
+			if err := h.worker.TriggerCheck(""); err != nil {
 				st, b := jsonStatus(http.StatusBadGateway, map[string]any{"error": err.Error()})
 				return st, b, "application/json"
 			}
@@ -184,14 +174,13 @@ func (h *managementHandlers) debugUsage() (int, []byte, string) {
 		st, b := jsonStatus(http.StatusBadRequest, map[string]any{"error": "no enabled accounts"})
 		return st, b, "application/json"
 	}
-	worker := h.currentWorker()
-	if worker == nil {
+	if h.worker == nil {
 		st, b := jsonStatus(http.StatusServiceUnavailable, map[string]any{"error": "worker not running"})
 		return st, b, "application/json"
 	}
 	// Grab the first FSM's credentials + client.
 	var fsm *AccountFSM
-	worker.EachFSM(func(f *AccountFSM) {
+	h.worker.EachFSM(func(f *AccountFSM) {
 		if fsm == nil {
 			fsm = f
 		}
@@ -207,12 +196,9 @@ func (h *managementHandlers) debugUsage() (int, []byte, string) {
 		st, b := jsonStatus(http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return st, b, "application/json"
 	}
-	fsm.mu.Lock()
-	creds := fsm.Creds
-	fsm.mu.Unlock()
-	req.Header.Set("Authorization", "Bearer "+creds.AccessToken)
-	if creds.ChatGPTAccountID != "" {
-		req.Header.Set("Chatgpt-Account-Id", creds.ChatGPTAccountID)
+	req.Header.Set("Authorization", "Bearer "+fsm.Creds.AccessToken)
+	if fsm.Creds.ChatGPTAccountID != "" {
+		req.Header.Set("Chatgpt-Account-Id", fsm.Creds.ChatGPTAccountID)
 	}
 	req.Header.Set("User-Agent", codexUserAgent)
 	body, err := cli.do(req)
@@ -328,20 +314,16 @@ func (h *managementHandlers) putSettings(body []byte) (int, []byte) {
 	}
 	cfg = normalizeConfig(cfg)
 	h.mu.Lock()
-	oldConfig := h.state.Config
 	h.state.Config = cfg
+	h.mu.Unlock()
 	if err := saveState(h.statePath, h.state); err != nil {
-		h.state.Config = oldConfig
-		h.mu.Unlock()
 		return jsonStatus(http.StatusInternalServerError, map[string]any{"error": err.Error()})
 	}
-	onChanged := h.OnSettingsChanged
-	h.mu.Unlock()
 	// Restart the worker so the new config (especially enabled_accounts and
 	// refresh_interval) takes effect immediately. Without this the worker
 	// keeps running with the old config until a plugin reload.
-	if onChanged != nil {
-		onChanged()
+	if h.OnSettingsChanged != nil {
+		h.OnSettingsChanged()
 	}
 	return jsonOK(map[string]any{
 		"refresh_interval":  formatDuration(cfg.RefreshInterval),
@@ -352,8 +334,8 @@ func (h *managementHandlers) putSettings(body []byte) (int, []byte) {
 
 func (h *managementHandlers) logsJSON() (int, []byte) {
 	var entries []LogEntry
-	if worker := h.currentWorker(); worker != nil {
-		entries = worker.Logs().all()
+	if h.worker != nil {
+		entries = h.worker.Logs().all()
 	}
 	return jsonOK(map[string]any{"entries": entries})
 }
@@ -363,8 +345,8 @@ func (h *managementHandlers) checkOne(body []byte) (int, []byte) {
 		AuthIndex string `json:"auth_index"`
 	}
 	_ = json.Unmarshal(body, &req)
-	if worker := h.currentWorker(); worker != nil {
-		if err := worker.TriggerCheck(req.AuthIndex); err != nil {
+	if h.worker != nil {
+		if err := h.worker.TriggerCheck(req.AuthIndex); err != nil {
 			return jsonStatus(http.StatusNotFound, map[string]any{"error": err.Error()})
 		}
 	}
@@ -378,8 +360,8 @@ func (h *managementHandlers) resetOne(body []byte) (int, []byte) {
 	if err := json.Unmarshal(body, &req); err != nil || req.AuthIndex == "" {
 		return jsonStatus(http.StatusBadRequest, map[string]any{"error": "auth_index required"})
 	}
-	if worker := h.currentWorker(); worker != nil {
-		if err := worker.ForceConfirm(req.AuthIndex); err != nil {
+	if h.worker != nil {
+		if err := h.worker.ForceConfirm(req.AuthIndex); err != nil {
 			return jsonStatus(http.StatusNotFound, map[string]any{"error": err.Error()})
 		}
 	}
@@ -403,17 +385,10 @@ func (h *managementHandlers) importState(body []byte) (int, []byte) {
 		s.Accounts = map[string]AccountRuntime{}
 	}
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	for _, account := range h.state.Accounts {
-		if account.State == StateRECONCILING || account.Attempt.RedeemRequestID != "" && account.State != StateDONE {
-			return jsonStatus(http.StatusConflict, map[string]any{"error": "cannot import while a reset attempt is unresolved"})
-		}
-	}
-	oldConfig, oldAccounts := h.state.Config, h.state.Accounts
 	h.state.Config = s.Config
 	h.state.Accounts = s.Accounts
+	h.mu.Unlock()
 	if err := saveState(h.statePath, h.state); err != nil {
-		h.state.Config, h.state.Accounts = oldConfig, oldAccounts
 		return jsonStatus(http.StatusInternalServerError, map[string]any{"error": err.Error()})
 	}
 	return jsonOK(map[string]any{"imported": true})

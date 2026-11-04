@@ -52,20 +52,14 @@ func resetTestClock() {
 	testClockAdvancer = nil
 }
 
-func newTestWorker(cfg Config, enabled []string, loader CredsLoader, now func() time.Time) *Worker {
-	w := NewWorker(cfg, enabled, loader, now)
-	w.Checkpoint = func(AccountRuntime) error { return nil }
-	return w
-}
-
 func TestWorker_DrivesMultipleAccountsToDone(t *testing.T) {
 	defer resetTestClock()
 	E := time.Date(2026, 7, 19, 18, 0, 0, 0, time.UTC)
 	cfg := Config{RefreshInterval: 6 * time.Hour, TriggerLeadTime: 6 * time.Hour}
 	fcA := &fakeClient{credits: map[string]*Credit{"a1": {ID: "a1", Status: "available", ExpiresAt: E}}, weeklyPct: 10, consumeResp: ConsumeResponse{Code: ConsumeCodeReset}}
 	fcB := &fakeClient{credits: map[string]*Credit{"b1": {ID: "b1", Status: "available", ExpiresAt: E}}, weeklyPct: 20, consumeResp: ConsumeResponse{Code: ConsumeCodeReset}}
-	credsA := CodexCredentials{AccessToken: "ta", ChatGPTAccountID: "aa", SeatFingerprint: "test-seat-a"}
-	credsB := CodexCredentials{AccessToken: "tb", ChatGPTAccountID: "bb", SeatFingerprint: "test-seat-b"}
+	credsA := CodexCredentials{AccessToken: "ta", ChatGPTAccountID: "aa"}
+	credsB := CodexCredentials{AccessToken: "tb", ChatGPTAccountID: "bb"}
 
 	loader := func(authID string) (CodexCredentials, ResetClient, error) {
 		switch authID {
@@ -74,9 +68,9 @@ func TestWorker_DrivesMultipleAccountsToDone(t *testing.T) {
 		case "b":
 			return credsB, fcB, nil
 		}
-		return CodexCredentials{SeatFingerprint: "test-seat"}, nil, errUnknownAccount
+		return CodexCredentials{}, nil, errUnknownAccount
 	}
-	w := newTestWorker(cfg, []string{"a", "b"}, loader, time.Now)
+	w := NewWorker(cfg, []string{"a", "b"}, loader, time.Now)
 	w.testAccelerate = true
 	clock := withTestClock(w, E.Add(-12*time.Hour))
 
@@ -130,9 +124,9 @@ func TestWorker_TriggerCheckDefersNextAuto(t *testing.T) {
 	fc := &fakeClient{credits: map[string]*Credit{"c1": {ID: "c1", Status: "available", ExpiresAt: E}}, weeklyPct: 50, consumeResp: ConsumeResponse{Code: ConsumeCodeReset}}
 	start := time.Date(2026, 7, 19, 0, 0, 0, 0, time.UTC)
 	loader := func(string) (CodexCredentials, ResetClient, error) {
-		return CodexCredentials{AccessToken: "t", SeatFingerprint: "test-seat"}, fc, nil
+		return CodexCredentials{AccessToken: "t"}, fc, nil
 	}
-	w := newTestWorker(cfg, []string{"a"}, loader, time.Now)
+	w := NewWorker(cfg, []string{"a"}, loader, time.Now)
 	w.testAccelerate = true
 	clock := withTestClock(w, start)
 
@@ -174,9 +168,9 @@ func TestWorker_StateSyncPropagatesFSMState(t *testing.T) {
 	cfg := Config{RefreshInterval: 6 * time.Hour, TriggerLeadTime: 6 * time.Hour}
 	fc := &fakeClient{credits: map[string]*Credit{"a1": {ID: "a1", Status: "available", ExpiresAt: E}}, weeklyPct: 10, consumeResp: ConsumeResponse{Code: ConsumeCodeReset}}
 	loader := func(string) (CodexCredentials, ResetClient, error) {
-		return CodexCredentials{AccessToken: "t", SeatFingerprint: "test-seat"}, fc, nil
+		return CodexCredentials{AccessToken: "t"}, fc, nil
 	}
-	w := newTestWorker(cfg, []string{"a"}, loader, time.Now)
+	w := NewWorker(cfg, []string{"a"}, loader, time.Now)
 	w.testAccelerate = true
 	withTestClock(w, E.Add(-12*time.Hour))
 
@@ -224,9 +218,9 @@ func TestWorker_ForceConfirmNotFound(t *testing.T) {
 	defer resetTestClock()
 	cfg := Config{RefreshInterval: 12 * time.Hour, TriggerLeadTime: 6 * time.Hour}
 	loader := func(string) (CodexCredentials, ResetClient, error) {
-		return CodexCredentials{AccessToken: "t", SeatFingerprint: "test-seat"}, &fakeClient{}, nil
+		return CodexCredentials{AccessToken: "t"}, &fakeClient{}, nil
 	}
-	w := newTestWorker(cfg, []string{"a"}, loader, time.Now)
+	w := NewWorker(cfg, []string{"a"}, loader, time.Now)
 	done := make(chan struct{})
 	go func() { w.Run(); close(done) }()
 	time.Sleep(50 * time.Millisecond) // let Run() create the FSM
@@ -255,9 +249,9 @@ func TestWorker_ManualResetImmediate(t *testing.T) {
 		consumeResp: ConsumeResponse{Code: ConsumeCodeReset, WindowsReset: 1},
 	}
 	loader := func(string) (CodexCredentials, ResetClient, error) {
-		return CodexCredentials{AccessToken: "t", SeatFingerprint: "test-seat"}, fc, nil
+		return CodexCredentials{AccessToken: "t"}, fc, nil
 	}
-	w := newTestWorker(cfg, []string{"a"}, loader, clock.Now)
+	w := NewWorker(cfg, []string{"a"}, loader, clock.Now)
 	patrolled := make(chan int, 1)
 	w.StateSync = func(_ string, fsm *AccountFSM) {
 		if fsm.State() == StateIDLE {
@@ -292,8 +286,7 @@ func TestWorker_ManualResetImmediate(t *testing.T) {
 	}
 	fsm := w.fsms["a"]
 	clock.AdvanceTo(fsm.NextWake())
-	// The worker has joined; finish this raw FSM verification explicitly.
-	fsm.StepAndSettle()
+	w.stepAccountSafe("a")
 	if rec := fsm.TakePendingHistory(); rec == nil || !rec.Success || fsm.State() != StateIDLE {
 		t.Fatalf("manual verification: state=%s record=%+v", fsm.State(), rec)
 	}
@@ -302,8 +295,8 @@ func TestWorker_ManualResetImmediate(t *testing.T) {
 func armedWorkerFixture(t *testing.T) (*Worker, *AccountFSM, *fakeClient, *fakeClock, time.Time) {
 	t.Helper()
 	fsm, fc, clock, trigger := armedFSMFixture(t)
-	w := newTestWorker(fsm.Cfg, []string{"acct"}, func(string) (CodexCredentials, ResetClient, error) {
-		return CodexCredentials{SeatFingerprint: "test-seat"}, fc, nil
+	w := NewWorker(fsm.Cfg, []string{"acct"}, func(string) (CodexCredentials, ResetClient, error) {
+		return CodexCredentials{}, fc, nil
 	}, clock.Now)
 	w.fsms["acct"] = fsm
 	return w, fsm, fc, clock, trigger
@@ -510,11 +503,11 @@ func TestWorker_RetriesInitialCredentialLoadFailure(t *testing.T) {
 	var attempts int32
 	loader := func(string) (CodexCredentials, ResetClient, error) {
 		if atomic.AddInt32(&attempts, 1) == 1 {
-			return CodexCredentials{SeatFingerprint: "test-seat"}, nil, errString("auth file not ready")
+			return CodexCredentials{}, nil, errString("auth file not ready")
 		}
-		return CodexCredentials{AccessToken: "t", SeatFingerprint: "test-seat"}, fc, nil
+		return CodexCredentials{AccessToken: "t"}, fc, nil
 	}
-	w := newTestWorker(cfg, []string{"a"}, loader, time.Now)
+	w := NewWorker(cfg, []string{"a"}, loader, time.Now)
 	w.testAccelerate = true
 	clock := withTestClock(w, start)
 
@@ -569,9 +562,9 @@ func TestWorker_WildcardResolvesAndReapsAccounts(t *testing.T) {
 	cfg := Config{RefreshInterval: 6 * time.Hour, TriggerLeadTime: 6 * time.Hour}
 	fc := &fakeClient{credits: map[string]*Credit{}, weeklyPct: 50}
 	loader := func(string) (CodexCredentials, ResetClient, error) {
-		return CodexCredentials{AccessToken: "t", SeatFingerprint: "test-seat"}, fc, nil
+		return CodexCredentials{AccessToken: "t"}, fc, nil
 	}
-	w := newTestWorker(cfg, []string{allAccountsWildcard}, loader, time.Now)
+	w := NewWorker(cfg, []string{allAccountsWildcard}, loader, time.Now)
 
 	// Wildcard is not an account: nothing is serviced before the first resolve.
 	if got := wildcardFsmCount(w); got != 0 {
@@ -627,9 +620,9 @@ func TestWorker_WildcardEnumerationFailureKeepsPreviousSet(t *testing.T) {
 	cfg := Config{RefreshInterval: 6 * time.Hour, TriggerLeadTime: 6 * time.Hour}
 	fc := &fakeClient{credits: map[string]*Credit{}, weeklyPct: 50}
 	loader := func(string) (CodexCredentials, ResetClient, error) {
-		return CodexCredentials{AccessToken: "t", SeatFingerprint: "test-seat"}, fc, nil
+		return CodexCredentials{AccessToken: "t"}, fc, nil
 	}
-	w := newTestWorker(cfg, []string{allAccountsWildcard}, loader, time.Now)
+	w := NewWorker(cfg, []string{allAccountsWildcard}, loader, time.Now)
 	failing := false
 	w.AccountEnumerator = func() ([]string, error) {
 		if failing {
@@ -664,9 +657,9 @@ func TestWorker_StaticModeNeverCallsEnumerator(t *testing.T) {
 	cfg := Config{RefreshInterval: 6 * time.Hour, TriggerLeadTime: 6 * time.Hour}
 	fc := &fakeClient{credits: map[string]*Credit{}, weeklyPct: 50}
 	loader := func(string) (CodexCredentials, ResetClient, error) {
-		return CodexCredentials{AccessToken: "t", SeatFingerprint: "test-seat"}, fc, nil
+		return CodexCredentials{AccessToken: "t"}, fc, nil
 	}
-	w := newTestWorker(cfg, []string{"a"}, loader, time.Now)
+	w := NewWorker(cfg, []string{"a"}, loader, time.Now)
 	w.AccountEnumerator = func() ([]string, error) {
 		t.Fatal("enumerator must not be called without the wildcard")
 		return nil, nil
@@ -687,9 +680,9 @@ func TestWorker_WildcardResolveHonorsCredentialBackoff(t *testing.T) {
 	var attempts int32
 	loader := func(string) (CodexCredentials, ResetClient, error) {
 		atomic.AddInt32(&attempts, 1)
-		return CodexCredentials{SeatFingerprint: "test-seat"}, nil, errString("boom")
+		return CodexCredentials{}, nil, errString("boom")
 	}
-	w := newTestWorker(cfg, []string{allAccountsWildcard}, loader, time.Now)
+	w := NewWorker(cfg, []string{allAccountsWildcard}, loader, time.Now)
 	w.AccountEnumerator = func() ([]string, error) { return []string{"a"}, nil }
 
 	w.maybeResolveWildcard()

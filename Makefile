@@ -1,5 +1,5 @@
 PLUGIN_NAME ?= codex-auto-reset
-VERSION ?= 0.1.14-owner-recovery.2
+VERSION ?= 0.1.0
 BUILD_DIR ?= dist
 GOOS ?= $(shell go env GOOS)
 GOARCH ?= $(shell go env GOARCH)

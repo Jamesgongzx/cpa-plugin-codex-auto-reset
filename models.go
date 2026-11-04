@@ -1,7 +1,6 @@
 package main
 
 import (
-	"maps"
 	"sort"
 	"time"
 )
@@ -10,13 +9,12 @@ import (
 type State string
 
 const (
-	StateIDLE        State = "IDLE"
-	StateARMED       State = "ARMED"
-	StateCONFIRMING  State = "CONFIRMING"
-	StateRESETTING   State = "RESETTING"
-	StateVERIFYING   State = "VERIFYING"
-	StateRECONCILING State = "RECONCILING"
-	StateDONE        State = "DONE"
+	StateIDLE       State = "IDLE"
+	StateARMED      State = "ARMED"
+	StateCONFIRMING State = "CONFIRMING"
+	StateRESETTING  State = "RESETTING"
+	StateVERIFYING  State = "VERIFYING"
+	StateDONE       State = "DONE"
 )
 
 // Credit models one reset-credit row from GET /rate-limit-reset-credits
@@ -30,24 +28,15 @@ type Credit struct {
 // Snapshot is a (credits, weekly %) pair captured at key moments during a
 // reset cycle: pre-reset confirmation, and post-reset verification.
 type Snapshot struct {
-	AvailableCount int      `json:"available_count"`
-	Credits        []Credit `json:"credits"`
-	// CreditStatuses retains exact wire statuses even for entries excluded
-	// from the available-credit candidates. Absence never means redeemed.
-	CreditStatuses map[string]string `json:"credit_statuses,omitempty"`
-	WeeklyPct      int               `json:"weekly_pct"`
-	CapturedAt     time.Time         `json:"captured_at"`
-}
-
-func cloneSnapshot(snapshot Snapshot) Snapshot {
-	snapshot.Credits = append([]Credit(nil), snapshot.Credits...)
-	snapshot.CreditStatuses = maps.Clone(snapshot.CreditStatuses)
-	return snapshot
+	AvailableCount int       `json:"available_count"`
+	Credits        []Credit  `json:"credits"`
+	WeeklyPct      int       `json:"weekly_pct"`
+	CapturedAt     time.Time `json:"captured_at"`
 }
 
 // ResetAttempt tracks one logical reset cycle (spec §5.1). A single
-// RedeemRequestID is minted on entry to RESETTING and reused for every retry.
-// Retry safety depends on the upstream same-request, same-credit protocol.
+// RedeemRequestID is minted on entry to RESETTING and reused for every retry
+// in that cycle, so OpenAI dedupes and never double-consumes.
 type ResetAttempt struct {
 	RedeemRequestID string    `json:"redeem_request_id"`
 	TargetCreditID  string    `json:"target_credit_id"`
@@ -55,12 +44,6 @@ type ResetAttempt struct {
 	StartedAt       time.Time `json:"started_at"`
 	Attempt         int       `json:"attempt"`
 	NextRetryAt     time.Time `json:"next_retry_at"`
-	SeatFingerprint string    `json:"seat_fingerprint,omitempty"`
-	// Dispatches is checkpointed before each POST, including the initial one,
-	// so restarting cannot replenish the bounded retry budget.
-	Dispatches   int  `json:"dispatches,omitempty"`
-	Accepted     bool `json:"accepted,omitempty"`
-	RetryStopped bool `json:"retry_stopped,omitempty"`
 }
 
 // LogEntry is one audit-trail record (spec §8.1). Every state transition and

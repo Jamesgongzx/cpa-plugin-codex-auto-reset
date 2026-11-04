@@ -43,16 +43,14 @@ type fakeClient struct {
 func (f *fakeClient) ListCredits(CodexCredentials) (Snapshot, error) {
 	f.listCalls++
 	credits := make([]Credit, 0, len(f.credits))
-	statuses := make(map[string]string, len(f.credits))
 	for _, c := range f.credits {
 		credits = append(credits, *c)
-		statuses[c.ID] = c.Status
 	}
 	// WeeklyPct=-1 matches parseResetCreditsResponse (the reset-credits endpoint
 	// does not return weekly %). stepCONFIRMING fetches usage separately to fill
 	// in the real value; returning a real value here would mask the confirm-time
 	// GetUsage requirement (reviewer issue I1/I2).
-	return Snapshot{Credits: credits, CreditStatuses: statuses, AvailableCount: countAvail(credits), WeeklyPct: -1}, nil
+	return Snapshot{Credits: credits, AvailableCount: countAvail(credits), WeeklyPct: -1}, nil
 }
 
 func (f *fakeClient) GetUsage(CodexCredentials) (Snapshot, error) {
@@ -110,14 +108,6 @@ func mapToCredits(m map[string]*Credit) []Credit {
 
 type fakeClock struct{ t time.Time }
 
-// Pure FSM fixtures use an explicit successful in-memory checkpoint. Recovery
-// tests below instead write and reload the actual state file.
-func newTestAccountFSM(authID string, creds CodexCredentials, cfg Config, client ResetClient, now func() time.Time, logf LogFn) *AccountFSM {
-	fsm := NewAccountFSM(authID, creds, cfg, client, now, logf)
-	fsm.Checkpoint = func(AccountRuntime) error { return nil }
-	return fsm
-}
-
 func (f *fakeClock) Now() time.Time { return f.t }
 
 // drive runs the FSM until DONE (or step cap), advancing the fake clock to
@@ -148,7 +138,7 @@ func TestFSM_HappyPath_AllStates(t *testing.T) {
 	logf := func(level, scope string, state State, msg, next string, nextAt *time.Time, d map[string]any) {
 		logs = append(logs, fmt.Sprintf("%s/%s: %s", level, state, msg))
 	}
-	fsm := newTestAccountFSM("acct1", CodexCredentials{AccessToken: "t", ChatGPTAccountID: "a", SeatFingerprint: "test-seat"}, cfg, fc, clock.Now, logf)
+	fsm := NewAccountFSM("acct1", CodexCredentials{AccessToken: "t", ChatGPTAccountID: "a"}, cfg, fc, clock.Now, logf)
 
 	drive(t, fsm, clock)
 
@@ -183,7 +173,7 @@ func TestFSM_IdempotentRetry_FailureThenSuccess(t *testing.T) {
 		failErr:     errors.New("transient network timeout"),
 	}
 	clock := &fakeClock{t: E.Add(-12 * time.Hour)}
-	fsm := newTestAccountFSM("acct1", CodexCredentials{SeatFingerprint: "test-seat"}, cfg, fc, clock.Now, nil)
+	fsm := NewAccountFSM("acct1", CodexCredentials{}, cfg, fc, clock.Now, nil)
 
 	drive(t, fsm, clock)
 
@@ -212,7 +202,7 @@ func TestFSM_AlreadyRedeemed_TreatedAsSuccess(t *testing.T) {
 		consumeResp: ConsumeResponse{Code: ConsumeCodeAlreadyRedeemed, WindowsReset: 0},
 	}
 	clock := &fakeClock{t: E.Add(-12 * time.Hour)}
-	fsm := newTestAccountFSM("acct1", CodexCredentials{SeatFingerprint: "test-seat"}, cfg, fc, clock.Now, nil)
+	fsm := NewAccountFSM("acct1", CodexCredentials{}, cfg, fc, clock.Now, nil)
 
 	drive(t, fsm, clock)
 
@@ -227,9 +217,10 @@ func TestFSM_AlreadyRedeemed_TreatedAsSuccess(t *testing.T) {
 	}
 }
 
-// Retries remain bounded, but an unknown outcome keeps the original attempt
-// in reconciliation instead of allowing a fresh credit cycle.
-func TestFSM_RetriesExhausted_HoldsOriginalAttempt(t *testing.T) {
+// TestFSM_RetriesExhausted_GivesUp: Consume always returns a network error.
+// Expect 6 POSTs (1 initial + 5 retries), all with the same UUID, then DONE
+// with the credit NOT redeemed.
+func TestFSM_RetriesExhausted_GivesUp(t *testing.T) {
 	E := time.Date(2026, 7, 19, 18, 23, 47, 0, time.UTC)
 	cfg := Config{RefreshInterval: 6 * time.Hour, TriggerLeadTime: 6 * time.Hour}
 	fc := &fakeClient{
@@ -239,12 +230,12 @@ func TestFSM_RetriesExhausted_HoldsOriginalAttempt(t *testing.T) {
 		failErr:    errors.New("persistent network failure"),
 	}
 	clock := &fakeClock{t: E.Add(-12 * time.Hour)}
-	fsm := newTestAccountFSM("acct1", CodexCredentials{SeatFingerprint: "test-seat"}, cfg, fc, clock.Now, nil)
+	fsm := NewAccountFSM("acct1", CodexCredentials{}, cfg, fc, clock.Now, nil)
 
 	drive(t, fsm, clock)
 
-	if fsm.State() != StateRECONCILING {
-		t.Fatalf("final state = %s, want RECONCILING", fsm.State())
+	if fsm.State() != StateDONE {
+		t.Fatalf("final state = %s, want DONE", fsm.State())
 	}
 	if fc.consumeCalls != 6 {
 		t.Fatalf("consume calls = %d, want 6 (1 + 5 retries)", fc.consumeCalls)
@@ -271,7 +262,7 @@ func TestFSM_NoCredit_Stops(t *testing.T) {
 		consumeResp: ConsumeResponse{Code: ConsumeCodeNoCredit},
 	}
 	clock := &fakeClock{t: E.Add(-12 * time.Hour)}
-	fsm := newTestAccountFSM("acct1", CodexCredentials{SeatFingerprint: "test-seat"}, cfg, fc, clock.Now, nil)
+	fsm := NewAccountFSM("acct1", CodexCredentials{}, cfg, fc, clock.Now, nil)
 
 	drive(t, fsm, clock)
 
@@ -298,7 +289,7 @@ func TestFSM_CreditVanishesDuringARMED(t *testing.T) {
 		consumeResp: ConsumeResponse{Code: ConsumeCodeReset, WindowsReset: 2},
 	}
 	clock := &fakeClock{t: E.Add(-12 * time.Hour)}
-	fsm := newTestAccountFSM("acct1", CodexCredentials{SeatFingerprint: "test-seat"}, cfg, fc, clock.Now, nil)
+	fsm := NewAccountFSM("acct1", CodexCredentials{}, cfg, fc, clock.Now, nil)
 
 	// Step 1: IDLE sees available credit; now >= M, enters ARMED, sleeps to T.
 	next := fsm.Step()
@@ -343,8 +334,8 @@ func TestFSM_WrongCreditConsumed_DetectsMismatch(t *testing.T) {
 			"sooner": {ID: "sooner", Status: "available", ExpiresAt: E1},
 			"later":  {ID: "later", Status: "available", ExpiresAt: E2},
 		},
-		weeklyPct:      25,
-		consumeResp:    ConsumeResponse{Code: ConsumeCodeReset, WindowsReset: 2},
+		weeklyPct:     25,
+		consumeResp:   ConsumeResponse{Code: ConsumeCodeReset, WindowsReset: 2},
 		deductCreditID: "later", // server bug: deducts the wrong credit
 	}
 	clock := &fakeClock{t: E1.Add(-12 * time.Hour)}
@@ -352,12 +343,12 @@ func TestFSM_WrongCreditConsumed_DetectsMismatch(t *testing.T) {
 	logf := func(level, scope string, state State, msg, next string, nextAt *time.Time, d map[string]any) {
 		logs = append(logs, msg)
 	}
-	fsm := newTestAccountFSM("acct1", CodexCredentials{SeatFingerprint: "test-seat"}, cfg, fc, clock.Now, logf)
+	fsm := NewAccountFSM("acct1", CodexCredentials{}, cfg, fc, clock.Now, logf)
 
 	drive(t, fsm, clock)
 
-	if fsm.State() != StateRECONCILING {
-		t.Fatalf("final state = %s, want RECONCILING", fsm.State())
+	if fsm.State() != StateDONE {
+		t.Fatalf("final state = %s, want DONE", fsm.State())
 	}
 	if fc.consumeCalls != 1 {
 		t.Fatalf("consume calls = %d, want 1", fc.consumeCalls)
@@ -402,7 +393,7 @@ func TestFSM_QuotaLegIsLive_PartialWhenQuotaDoesNotRecover(t *testing.T) {
 	logf := func(level, scope string, state State, msg, next string, nextAt *time.Time, d map[string]any) {
 		// no-op; we assert on FSM behavior, not logs
 	}
-	fsm := newTestAccountFSM("acct1", CodexCredentials{AccessToken: "t", SeatFingerprint: "test-seat"}, cfg, fc, clock.Now, logf)
+	fsm := NewAccountFSM("acct1", CodexCredentials{AccessToken: "t"}, cfg, fc, clock.Now, logf)
 
 	for i := 0; i < 50 && fsm.State() != StateDONE; i++ {
 		next := fsm.Step()
@@ -412,8 +403,8 @@ func TestFSM_QuotaLegIsLive_PartialWhenQuotaDoesNotRecover(t *testing.T) {
 		clock.t = next
 	}
 
-	if fsm.State() != StateRECONCILING {
-		t.Fatalf("final state = %s, want RECONCILING", fsm.State())
+	if fsm.State() != StateDONE {
+		t.Fatalf("final state = %s, want DONE", fsm.State())
 	}
 	if fc.usageCalls == 0 {
 		t.Fatalf("GetUsage was never called at confirm time — quota leg is dead (regression of I1)")
@@ -449,26 +440,12 @@ func armedFSMFixture(t *testing.T) (*AccountFSM, *fakeClient, *fakeClock, time.T
 		consumeResp: ConsumeResponse{Code: ConsumeCodeReset, WindowsReset: 2},
 	}
 	clock := &fakeClock{t: E.Add(-12 * time.Hour)}
-	fsm := newTestAccountFSM("acct", CodexCredentials{SeatFingerprint: "test-seat"}, cfg, fc, clock.Now, nil)
+	fsm := NewAccountFSM("acct", CodexCredentials{}, cfg, fc, clock.Now, nil)
 	wake := fsm.Step()
 	if fsm.State() != StateARMED || !wake.Equal(E.Add(-cfg.TriggerLeadTime)) {
 		t.Fatalf("initial state=%s wake=%v, want ARMED at T", fsm.State(), wake)
 	}
 	return fsm, fc, clock, wake
-}
-
-func TestFSM_AutomaticConfirmRequiresWeeklyEvidence(t *testing.T) {
-	fsm, fc, clock, trigger := armedFSMFixture(t)
-	clock.t = trigger
-	fc.weeklyPct = -1
-	fsm.Step()
-	fsm.Step()
-	if fsm.State() == StateRESETTING {
-		fsm.Step()
-	}
-	if fc.consumeCalls != 0 {
-		t.Fatalf("consume calls = %d with unknown pre-reset weekly evidence", fc.consumeCalls)
-	}
 }
 
 func TestFSM_PinnedTargetUnavailable(t *testing.T) {

@@ -69,10 +69,12 @@ func parseResetCreditsResponse(raw []byte, now time.Time) (Snapshot, error) {
 
 // parseUsageResponse parses GET /wham/usage using flexible map lookups.
 // The real wire shape (confirmed from live data) is:
-//   "rate_limit": {
-//     "primary_window": {"limit_window_seconds": 604800, "used_percent": 9},
-//     "secondary_window": null
-//   }
+//
+//	"rate_limit": {
+//	  "primary_window": {"limit_window_seconds": 604800, "used_percent": 9},
+//	  "secondary_window": null
+//	}
+//
 // primary_window can be the WEEKLY window (604800s) when there's no
 // secondary. We identify the weekly window by limit_window_seconds ≈ 604800,
 // NOT by position (primary/secondary). code_review_rate_limit may also be
@@ -129,11 +131,40 @@ func parseUsageResponse(raw []byte, now time.Time) (Snapshot, error) {
 		}
 	}
 
+	weeklyResetAt, weeklyWindowSeconds, weeklyObservedAt := routingWeeklyMetadata(doc, now)
 	return Snapshot{
-		AvailableCount: availableCount,
-		WeeklyPct:      weeklyPct,
-		CapturedAt:     now,
+		AvailableCount:      availableCount,
+		WeeklyPct:           weeklyPct,
+		CapturedAt:          now,
+		WeeklyResetAt:       weeklyResetAt,
+		WeeklyWindowSeconds: weeklyWindowSeconds,
+		WeeklyObservedAt:    weeklyObservedAt,
 	}, nil
+}
+
+// routingWeeklyMetadata retains only the generation quota's weekly window.
+// Code-review limits are a different allowance. This does not change the
+// existing weekly-percent parser or any reset transition or provider request.
+func routingWeeklyMetadata(doc map[string]any, now time.Time) (time.Time, int, time.Time) {
+	rl, ok := getMapAny(doc, "rate_limit", "rateLimit")
+	if ok {
+		for _, key := range []string{"primary_window", "primaryWindow", "secondary_window", "secondaryWindow"} {
+			win, exists := getMapAny(rl, key)
+			if !exists {
+				continue
+			}
+			seconds, hasSeconds := getIntAny(win, "limit_window_seconds", "limitWindowSeconds")
+			reset, hasReset := getIntAny(win, "reset_at", "resetAt")
+			if !hasSeconds || seconds < 600000 || seconds > 610000 || !hasReset || reset <= 0 {
+				continue
+			}
+			at := time.Unix(int64(reset), 0).UTC()
+			if at.After(now) && at.Sub(now) <= time.Duration(seconds)*time.Second+time.Hour {
+				return at, seconds, now
+			}
+		}
+	}
+	return time.Time{}, 0, time.Time{}
 }
 
 // --- flexible map helpers (mirror codex-quota-scheduler's getMap/getInt/getFloat64) ---

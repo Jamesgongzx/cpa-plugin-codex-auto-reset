@@ -183,7 +183,9 @@ func (f *AccountFSM) now() time.Time {
 func (f *AccountFSM) triggerTime(c Credit) time.Time { return c.ExpiresAt.Add(-f.Cfg.TriggerLeadTime) }
 
 // armThreshold returns M = T - R (the moment we enter ARMED).
-func (f *AccountFSM) armThreshold(c Credit) time.Time { return f.triggerTime(c).Add(-f.Cfg.RefreshInterval) }
+func (f *AccountFSM) armThreshold(c Credit) time.Time {
+	return f.triggerTime(c).Add(-f.Cfg.RefreshInterval)
+}
 
 func (f *AccountFSM) log(level, msg, nextAction string, nextAt *time.Time, details map[string]any) {
 	if f.Logf != nil {
@@ -204,7 +206,7 @@ func (f *AccountFSM) stepIDLE() time.Time {
 	// Also fetch weekly % so the UI card can display it. The /rate-limit-
 	// reset-credits endpoint doesn't return weekly %, so we need /usage.
 	if usage, err := f.Client.GetUsage(f.Creds); err == nil {
-		snap.WeeklyPct = usage.WeeklyPct
+		snap = snap.withUsage(usage)
 		f.lastSnapshot = snap
 	}
 	avail := availableCreditsSorted(snap.Credits, now)
@@ -309,7 +311,7 @@ func (f *AccountFSM) stepCONFIRMING() time.Time {
 		f.log("error", fmt.Sprintf("confirm usage failed: %v", err), "abandon", nil, nil)
 		return time.Time{}
 	}
-	snap.WeeklyPct = usage.WeeklyPct
+	snap = snap.withUsage(usage)
 	f.attempt = ResetAttempt{
 		RedeemRequestID: uuid.NewString(),
 		TargetCreditID:  target.ID,
@@ -323,11 +325,11 @@ func (f *AccountFSM) stepCONFIRMING() time.Time {
 			shortID(target.ID), snap.AvailableCount, snap.WeeklyPct),
 		"send reset request", nil,
 		map[string]any{
-			"credit_id":           target.ID,
-			"pre_credits":         snap.AvailableCount,
-			"pre_weekly_pct":      snap.WeeklyPct,
-			"target_expires_at":   target.ExpiresAt,
-			"redeem_request_id":   f.attempt.RedeemRequestID,
+			"credit_id":         target.ID,
+			"pre_credits":       snap.AvailableCount,
+			"pre_weekly_pct":    snap.WeeklyPct,
+			"target_expires_at": target.ExpiresAt,
+			"redeem_request_id": f.attempt.RedeemRequestID,
 		})
 	return f.now()
 }
@@ -397,7 +399,7 @@ func (f *AccountFSM) stepVERIFYING() time.Time {
 		return time.Time{}
 	}
 	// Update lastSnapshot with post-reset data so the UI shows the new state.
-	credits.WeeklyPct = usage.WeeklyPct
+	credits = credits.withUsage(usage)
 	f.lastSnapshot = credits
 
 	// Triple deduction check (spec §4.3 invariant 3).
@@ -414,15 +416,15 @@ func (f *AccountFSM) stepVERIFYING() time.Time {
 	f.state = StateDONE
 	// Build detailed details map with full before/after snapshot.
 	details := map[string]any{
-		"credit_id":            f.attempt.TargetCreditID,
-		"redeem_request_id":    f.attempt.RedeemRequestID,
-		"pre_credits":          f.attempt.PreSnapshot.AvailableCount,
-		"post_credits":         credits.AvailableCount,
-		"pre_weekly_pct":       f.attempt.PreSnapshot.WeeklyPct,
-		"post_weekly_pct":      usage.WeeklyPct,
-		"target_gone":          targetGone,
-		"count_down_1":         countDown1,
-		"quota_recovered":      quotaUp,
+		"credit_id":         f.attempt.TargetCreditID,
+		"redeem_request_id": f.attempt.RedeemRequestID,
+		"pre_credits":       f.attempt.PreSnapshot.AvailableCount,
+		"post_credits":      credits.AvailableCount,
+		"pre_weekly_pct":    f.attempt.PreSnapshot.WeeklyPct,
+		"post_weekly_pct":   usage.WeeklyPct,
+		"target_gone":       targetGone,
+		"count_down_1":      countDown1,
+		"quota_recovered":   quotaUp,
 	}
 
 	success := targetGone && countDown1 && quotaUp

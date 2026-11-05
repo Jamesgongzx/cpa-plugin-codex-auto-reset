@@ -32,6 +32,18 @@ type Snapshot struct {
 	Credits        []Credit  `json:"credits"`
 	WeeklyPct      int       `json:"weekly_pct"`
 	CapturedAt     time.Time `json:"captured_at"`
+	// Weekly metadata is observed by the existing usage GET, independently of credits.
+	WeeklyResetAt       time.Time `json:"weekly_reset_at,omitzero"`
+	WeeklyWindowSeconds int       `json:"weekly_window_seconds,omitempty"`
+	WeeklyObservedAt    time.Time `json:"weekly_observed_at,omitzero"`
+}
+
+func (s Snapshot) withUsage(usage Snapshot) Snapshot {
+	s.WeeklyPct = usage.WeeklyPct
+	s.WeeklyResetAt = usage.WeeklyResetAt
+	s.WeeklyWindowSeconds = usage.WeeklyWindowSeconds
+	s.WeeklyObservedAt = usage.WeeklyObservedAt
+	return s
 }
 
 // ResetAttempt tracks one logical reset cycle (spec §5.1). A single

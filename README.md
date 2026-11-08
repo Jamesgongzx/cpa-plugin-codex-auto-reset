@@ -137,8 +137,9 @@ redeems a credit. A bounded network timeout applies; a slow or offline host can
 delay the next observation. Authentication checks are observations, not an
 assertion of the exact provider-side revocation time or reason. A 401 signals
 a rejected token, a 403 signals a permission error, and network errors or
-quota limits do not by themselves mean authentication was revoked. A malformed
-2xx body is recorded as invalid response, with authentication accepted.
+quota limits do not by themselves mean authentication was revoked. Redirects
+are not followed; malformed 2xx bodies remain indeterminate and do not change
+the last confirmed authentication result.
 
 The authenticated management status response contains `auth_health` with the
 monitor state, interval, last cycle, and redacted per-account last check,
@@ -146,7 +147,12 @@ last successful authentication, first observed rejection, recovery, and
 last-known weekly and credit facts with observation times. The host's own
 routing eligibility is independent and may be stale. A new credential
 fingerprint starts in unknown state until an observation for it succeeds.
-Old facts retain their original observation time.
+Old facts retain their original observation time. Removed accounts may remain
+in the historical summary: join hashes against the current host account list
+and check observation times rather than treating every stored entry as current.
+`first_rejected` applies to the current credential generation;
+`pending_recovery` preserves an earlier rejected episode across a replacement
+until the replacement is successfully checked.
 
 Private `auth-health/` under the plugin state directory contains a durable
 summary and append-only segmented observations. Account keys are SHA-256 of
@@ -157,7 +163,10 @@ raw response, request body, account ID, or provider error prose is stored.
 AutoReset events include the endpoint, safe HTTP status and code, source,
 reset FSM phase and allowlisted consume result. The journal is pruned after
 14 days or 128 MiB, whichever occurs first; a write failure is reported to
-stderr. It cannot observe requests made directly by other tools, and the
+stderr. If its directory or summary cannot be opened, reset scheduling stays
+online and management reports `evidence_unavailable`; repair the path while
+preserving its contents and reconfigure the plugin to retry. It cannot observe
+requests made directly by other tools, and the
 routing journal remains the source for model use and conversation switches.
 
 ## Installation

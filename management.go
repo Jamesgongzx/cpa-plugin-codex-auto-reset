@@ -34,6 +34,7 @@ type managementHandlers struct {
 	statePath         string
 	worker            *Worker
 	health            *healthMonitor
+	healthUnavailable bool
 	lister            AccountLister // may be nil if host ABI not wired (tests)
 	OnSettingsChanged func()        // injected by main.go; restarts the worker with new config
 }
@@ -161,6 +162,8 @@ func (h *managementHandlers) statusJSON() (int, []byte) {
 	}
 	if h.health != nil {
 		out["auth_health"] = h.health.status()
+	} else if h.healthUnavailable {
+		out["auth_health"] = map[string]any{"running": false, "interval": "15m", "last_error": "evidence_unavailable", "accounts": map[string]healthSummary{}}
 	}
 	return jsonOK(out)
 }

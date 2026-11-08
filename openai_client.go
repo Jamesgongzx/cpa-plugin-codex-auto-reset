@@ -62,7 +62,11 @@ func (c *OpenAIClient) httpClient() *http.Client {
 }
 
 func (c *OpenAIClient) do(req *http.Request) ([]byte, error) {
-	resp, err := c.httpClient().Do(req)
+	// Reject redirects for every client so a login page or proxy redirect cannot
+	// appear to be a successful provider authentication check.
+	client := *c.httpClient()
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}

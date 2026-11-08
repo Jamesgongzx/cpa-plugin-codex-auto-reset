@@ -24,10 +24,13 @@ type healthSummary struct {
 	State                 string    `json:"state"`
 	Code                  string    `json:"code"`
 	LastChecked           time.Time `json:"last_checked"`
+	LastAttempt           time.Time `json:"last_attempt"`
+	LastRejected          time.Time `json:"last_rejected"`
 	LastSuccess           time.Time `json:"last_success"`
 	LastSuccessGeneration string    `json:"last_success_generation,omitempty"`
 	FirstRejected         time.Time `json:"first_rejected"`
 	LastRecovered         time.Time `json:"last_recovered"`
+	PendingRecovery       bool      `json:"pending_recovery,omitempty"`
 	WeeklyRemaining       int       `json:"weekly_remaining"`
 	WeeklyObserved        time.Time `json:"weekly_observed"`
 	WeeklyReset           time.Time `json:"weekly_reset"`
@@ -113,8 +116,11 @@ func classifyHealth(err error) (string, int) {
 					Code string `json:"code"`
 				} `json:"error"`
 			}
-			if json.Unmarshal(he.Body, &body) == nil && body.Error.Code == "token_revoked" {
-				return "token_revoked", 401
+			if json.Unmarshal(he.Body, &body) == nil {
+				switch body.Error.Code {
+				case "token_revoked", "token_expired", "invalid_token", "token_invalidated", "refresh_token_invalidated", "refresh_token_reused", "refresh_token_expired", "invalid_grant":
+					return body.Error.Code, 401
+				}
 			}
 			return "auth_failure", 401
 		}
@@ -136,7 +142,9 @@ func classifyHealth(err error) (string, int) {
 	return "transport_error", 0
 }
 func (s *healthStore) observe(id string, creds CodexCredentials, source, op string, snap Snapshot, err error) {
-	s.observeStarted(id, creds, source, op, "", "", snap, err, s.now())
+	acquired := s.now()
+	s.beginGeneration(id, creds, acquired)
+	s.observeStarted(id, creds, source, op, "", "", snap, err, acquired)
 }
 func (s *healthStore) observeStarted(id string, creds CodexCredentials, source, op, phase, result string, snap Snapshot, err error, started time.Time) {
 	code, status := classifyHealth(err)
@@ -148,31 +156,28 @@ func (s *healthStore) observeStarted(id string, creds CodexCredentials, source, 
 	ev := healthEvent{Time: now, Account: account, Generation: gen, Source: source, Operation: op, Phase: phase, Code: code, HTTPStatus: status, Result: result}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// Arrival order must not allow a slow old-generation request to supersede a newer one.
+	// Only the latest credential acquisition may update current health.
 	row := s.rows[account]
-	if !started.Before(row.lastStarted) {
-		if row.Generation != gen {
-			row.Generation = gen
-			row.State = "unknown"
-			row.FirstRejected = time.Time{}
-		}
-		row.lastStarted = started
+	if !started.Before(row.lastStarted) && row.Generation == gen {
+		row.LastAttempt = now
 		row.LastChecked = now
 		row.Code = code
 		switch code {
-		case "ok", "invalid_response":
-			if row.State == "rejected" {
+		case "ok":
+			if row.State == "rejected" || row.PendingRecovery {
 				row.LastRecovered = now
 			}
+			row.PendingRecovery = false
 			row.State = "valid"
 			row.LastSuccess = now
 			row.LastSuccessGeneration = gen
 			row.FirstRejected = time.Time{}
-		case "auth_failure", "token_revoked":
-			if row.State != "rejected" {
+		case "auth_failure", "token_revoked", "token_expired", "invalid_token", "token_invalidated", "refresh_token_invalidated", "refresh_token_reused", "refresh_token_expired", "invalid_grant":
+			if row.FirstRejected.IsZero() {
 				row.FirstRejected = now
 			}
 			row.State = "rejected"
+			row.LastRejected = now
 		}
 		if row.State == "" {
 			row.State = "unknown"
@@ -188,6 +193,7 @@ func (s *healthStore) observeStarted(id string, creds CodexCredentials, source, 
 		}
 		s.rows[account] = row
 	}
+
 	if e := s.appendEvent(ev); e != nil {
 		s.report(e)
 	}
@@ -195,7 +201,36 @@ func (s *healthStore) observeStarted(id string, creds CodexCredentials, source, 
 		s.report(e)
 	}
 }
-func (s *healthStore) credentialUnavailable(id string) {
+
+// beginGeneration is called immediately after credential acquisition. Its
+// timestamp is captured before the host load begins, so a delayed old load or
+// a later request using an old FSM credential cannot replace a newer grant.
+func (s *healthStore) beginGeneration(id string, creds CodexCredentials, acquired time.Time) {
+	account, gen := healthHash(id), healthHash(creds.AccessToken)
+	if account == "" || gen == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	row := s.rows[account]
+	if acquired.Before(row.lastStarted) {
+		return
+	}
+	row.lastStarted = acquired
+	if row.Generation != gen {
+		row.PendingRecovery = row.PendingRecovery || row.State == "rejected"
+		row.Generation = gen
+		row.State = "unknown"
+		row.Code = "credential_loaded"
+		row.FirstRejected = time.Time{}
+		row.LastAttempt = s.now().UTC()
+	}
+	s.rows[account] = row
+	if err := s.save(); err != nil {
+		s.report(err)
+	}
+}
+func (s *healthStore) credentialUnavailable(id string, acquired time.Time) {
 	now := s.now().UTC()
 	account := healthHash(id)
 	if account == "" {
@@ -204,12 +239,14 @@ func (s *healthStore) credentialUnavailable(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	row := s.rows[account]
-	row.LastChecked = now
-	row.Code = "credential_unavailable"
-	if row.State == "" {
+	if !acquired.Before(row.lastStarted) {
+		row.lastStarted = acquired
+		row.PendingRecovery = row.PendingRecovery || row.State == "rejected"
+		row.LastAttempt = now
+		row.Code = "credential_unavailable"
 		row.State = "unknown"
+		s.rows[account] = row
 	}
-	s.rows[account] = row
 	if err := s.appendEvent(healthEvent{Time: now, Account: account, Source: "monitor", Operation: "credentials", Code: "credential_unavailable"}); err != nil {
 		s.report(err)
 	}
@@ -217,6 +254,7 @@ func (s *healthStore) credentialUnavailable(id string) {
 		s.report(err)
 	}
 }
+
 func (s *healthStore) save() error {
 	raw, err := json.Marshal(s.rows)
 	if err != nil {
@@ -312,22 +350,52 @@ type observedClient struct {
 	inner             ResetClient
 	store             *healthStore
 	id, source, phase string
+	acquired          time.Time
 }
 
 func (c *observedClient) GetUsage(creds CodexCredentials) (Snapshot, error) {
-	start := time.Now()
+	start := c.acquired
+	if start.IsZero() {
+		start = time.Now()
+		c.store.beginGeneration(c.id, creds, start)
+	}
 	v, err := c.inner.GetUsage(creds)
 	c.store.observeStarted(c.id, creds, c.source, "usage", c.phase, "", v, err, start)
 	return v, err
 }
 func (c *observedClient) ListCredits(creds CodexCredentials) (Snapshot, error) {
-	start := time.Now()
+	start := c.acquired
+	if start.IsZero() {
+		start = time.Now()
+		c.store.beginGeneration(c.id, creds, start)
+	}
 	v, err := c.inner.ListCredits(creds)
 	c.store.observeStarted(c.id, creds, c.source, "credits", c.phase, "", v, err, start)
 	return v, err
 }
+func (c *observedClient) recordVerification(creds CodexCredentials, result string) {
+	switch result {
+	case "verified", "partial", "mismatch", "error":
+	default:
+		return
+	}
+	code := "ok"
+	if result != "verified" {
+		code = "verification_failed"
+	}
+	ev := healthEvent{Time: c.store.now().UTC(), Account: healthHash(c.id), Generation: healthHash(creds.AccessToken), Source: "autoreset", Operation: "verification", Phase: "VERIFYING", Code: code, Result: result}
+	c.store.mu.Lock()
+	defer c.store.mu.Unlock()
+	if err := c.store.appendEvent(ev); err != nil {
+		c.store.report(err)
+	}
+}
 func (c *observedClient) Consume(creds CodexCredentials, rid, cid string) (ConsumeResponse, error) {
-	start := time.Now()
+	start := c.acquired
+	if start.IsZero() {
+		start = time.Now()
+		c.store.beginGeneration(c.id, creds, start)
+	}
 	v, err := c.inner.Consume(creds, rid, cid)
 	result := ""
 	switch v.Code {
@@ -369,13 +437,15 @@ func (m *healthMonitor) cycle() {
 			return
 		default:
 		}
+		acquired := time.Now()
 		creds, client, e := m.loader(id)
 		if e != nil {
 			failed = true
-			m.store.credentialUnavailable(id)
+			m.store.credentialUnavailable(id, acquired)
 			continue
 		}
-		wrapped := &observedClient{inner: client, store: m.store, id: id, source: "monitor"}
+		m.store.beginGeneration(id, creds, acquired)
+		wrapped := &observedClient{inner: client, store: m.store, id: id, source: "monitor", acquired: acquired}
 		_, _ = wrapped.GetUsage(creds)
 	}
 	m.mu.Lock()

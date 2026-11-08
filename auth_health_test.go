@@ -1,8 +1,10 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -50,7 +52,7 @@ func TestHealthEpisodesAndPersistence(t *testing.T) {
 	}
 	now = now.Add(time.Minute)
 	s2.observe(id, CodexCredentials{AccessToken: "secret-two"}, "monitor", "usage", Snapshot{WeeklyObservedAt: now}, nil)
-	if got := s2.snapshot()[healthHash(id)]; got.State != "valid" {
+	if got := s2.snapshot()[healthHash(id)]; got.State != "valid" || got.LastRecovered.IsZero() || got.PendingRecovery {
 		t.Fatalf("recovery: %+v", got)
 	}
 	entries, err := os.ReadDir(dir)
@@ -111,6 +113,8 @@ func TestHealthClassifiesResponses(t *testing.T) {
 		{nil, "ok", 200},
 		{&HTTPStatusError{Code: 401, Body: []byte(`{"error":{"code":"token_revoked","message":"secret"}}`)}, "token_revoked", 401},
 		{&HTTPStatusError{Code: 401}, "auth_failure", 401},
+		{&HTTPStatusError{Code: 401, Body: []byte(`{"error":{"code":"token_expired"}}`)}, "token_expired", 401},
+		{&HTTPStatusError{Code: 401, Body: []byte(`{"error":{"code":"private-do-not-log"}}`)}, "auth_failure", 401},
 		{&HTTPStatusError{Code: 403}, "permission_denied", 403},
 		{&HTTPStatusError{Code: 429}, "quota_exceeded", 429},
 		{&HTTPStatusError{Code: 503}, "server_error", 503},
@@ -155,6 +159,7 @@ func TestHealthOlderRequestCannotOverwriteNewGeneration(t *testing.T) {
 	s, _ := newHealthStore(t.TempDir(), func() time.Time { return now })
 	a := CodexCredentials{AccessToken: "old"}
 	b := CodexCredentials{AccessToken: "new"}
+	s.beginGeneration("acct", b, now)
 	s.observeStarted("acct", b, "monitor", "usage", "", "", Snapshot{}, nil, now)
 	s.observeStarted("acct", a, "autoreset", "usage", "IDLE", "", Snapshot{}, &HTTPStatusError{Code: 401}, now.Add(-time.Second))
 	row := s.snapshot()[healthHash("acct")]
@@ -220,12 +225,13 @@ func TestObservedHTTPInvalidBodyAndConsumeOutcome(t *testing.T) {
 	}))
 	c := &observedClient{inner: inner, store: s, id: "account", source: "autoreset", phase: "VERIFYING"}
 	creds := CodexCredentials{AccessToken: "test-secret"}
+	s.observe("account", creds, "monitor", "usage", Snapshot{}, &HTTPStatusError{Code: 401})
 	_, err := c.GetUsage(creds)
 	if err == nil {
 		t.Fatal("invalid response accepted")
 	}
 	row := s.snapshot()[healthHash("account")]
-	if row.State != "valid" || row.Code != "invalid_response" {
+	if row.State != "rejected" || row.Code != "invalid_response" || !row.LastSuccess.IsZero() {
 		t.Fatalf("invalid body status: %+v", row)
 	}
 	if _, err = c.Consume(creds, "rid", "credit"); err != nil {
@@ -269,4 +275,204 @@ func TestHealthJournalSizeBound(t *testing.T) {
 	if _, err = os.Stat(previous); !os.IsNotExist(err) {
 		t.Fatalf("size pruning missed oldest: %v", err)
 	}
+}
+
+func TestHealthFailureDoesNotDisableResetConfiguration(t *testing.T) {
+	for _, kind := range []string{"malformed_summary", "invalid_directory"} {
+		t.Run(kind, func(t *testing.T) {
+			root := t.TempDir()
+			t.Setenv("HOME", t.TempDir())
+			healthPath := filepath.Join(root, "auth-health")
+			if kind == "malformed_summary" {
+				if err := os.Mkdir(healthPath, 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(healthPath, "health-summary.json"), []byte("{broken evidence"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := os.WriteFile(healthPath, []byte("not a directory"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			raw, _ := json.Marshal(lifecycleRequest{ConfigYAML: []byte("state_dir: " + root + "\nenabled_accounts: []\n")})
+			if err := configurePlugin(raw); err != nil {
+				t.Fatalf("diagnostics stopped reset configuration: %v", err)
+			}
+			t.Cleanup(cliproxyPluginShutdown)
+			if globalWorker == nil {
+				t.Fatal("reset worker was not started")
+			}
+			_, b := globalHandlers.statusJSON()
+			var status struct {
+				AuthHealth struct {
+					Running   bool   `json:"running"`
+					LastError string `json:"last_error"`
+				} `json:"auth_health"`
+			}
+			if err := json.Unmarshal(b, &status); err != nil {
+				t.Fatal(err)
+			}
+			if status.AuthHealth.Running || status.AuthHealth.LastError != "evidence_unavailable" {
+				t.Fatalf("unavailable health not exposed: %s", b)
+			}
+			if kind == "malformed_summary" {
+				got, err := os.ReadFile(filepath.Join(healthPath, "health-summary.json"))
+				if err != nil || string(got) != "{broken evidence" {
+					t.Fatalf("corrupted evidence not preserved: %q %v", got, err)
+				}
+			} else {
+				got, err := os.ReadFile(healthPath)
+				if err != nil || string(got) != "not a directory" {
+					t.Fatalf("invalid path not preserved: %q %v", got, err)
+				}
+			}
+			// Reconfiguration retries only after the operator preserves/repairs the path.
+			if kind == "malformed_summary" {
+				if err := os.Rename(filepath.Join(healthPath, "health-summary.json"), filepath.Join(healthPath, "health-summary.corrupt")); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := os.Rename(healthPath, healthPath+".preserved"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := configurePlugin(raw); err != nil {
+				t.Fatalf("repair reconfiguration failed: %v", err)
+			}
+			if globalHandlers.health == nil || globalHandlers.healthUnavailable {
+				t.Fatal("health monitor did not recover after repair")
+			}
+		})
+	}
+}
+
+func TestHealthReplacementRecoverySurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	clock := func() time.Time { return now }
+	s, _ := newHealthStore(dir, clock)
+	s.observe("acct", CodexCredentials{AccessToken: "old"}, "monitor", "usage", Snapshot{}, &HTTPStatusError{Code: 401})
+	now = now.Add(time.Second)
+	s.observe("acct", CodexCredentials{AccessToken: "new"}, "monitor", "usage", Snapshot{}, errors.New("network"))
+	s, err := newHealthStore(dir, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := s.snapshot()[healthHash("acct")]
+	if row.State != "unknown" || !row.PendingRecovery || !row.FirstRejected.IsZero() {
+		t.Fatalf("wrong new-generation state: %+v", row)
+	}
+	now = now.Add(time.Second)
+	s.observe("acct", CodexCredentials{AccessToken: "new"}, "monitor", "usage", Snapshot{}, nil)
+	row = s.snapshot()[healthHash("acct")]
+	if row.State != "valid" || row.PendingRecovery || row.LastRecovered.IsZero() {
+		t.Fatalf("recovery not recorded: %+v", row)
+	}
+}
+
+func TestHealthRejectsProviderRedirect(t *testing.T) {
+	hits := 0
+	destination := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits++; w.Write([]byte(`{}`)) }))
+	defer destination.Close()
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, destination.URL, http.StatusFound) }))
+	defer origin.Close()
+	client := &OpenAIClient{BaseURL: origin.URL, HTTP: origin.Client()}
+	_, err := client.GetUsage(CodexCredentials{AccessToken: "secret"})
+	code, status := classifyHealth(err)
+	if hits != 0 || code != "http_error" || status != 302 {
+		t.Fatalf("redirect followed or misclassified: hits=%d code=%s status=%d", hits, code, status)
+	}
+}
+
+func TestHealthOlderCredentialAfterNewerAcquisition(t *testing.T) {
+	now := time.Now()
+	s, _ := newHealthStore(t.TempDir(), func() time.Time { return now })
+	old := CodexCredentials{AccessToken: "old"}
+	newer := CodexCredentials{AccessToken: "new"}
+	oldAcquired := now
+	s.beginGeneration("acct", old, oldAcquired)
+	now = now.Add(time.Second)
+	newAcquired := now
+	s.beginGeneration("acct", newer, newAcquired)
+	s.observeStarted("acct", newer, "monitor", "usage", "", "", Snapshot{}, nil, newAcquired)
+	// A second old-FSM request starts after the new check but retains the old acquisition timestamp.
+	now = now.Add(time.Second)
+	s.observeStarted("acct", old, "autoreset", "usage", "VERIFYING", "", Snapshot{}, &HTTPStatusError{Code: 401}, oldAcquired)
+	row := s.snapshot()[healthHash("acct")]
+	if row.State != "valid" || row.Generation != healthHash("new") {
+		t.Fatalf("old acquisition replaced new grant: %+v", row)
+	}
+}
+
+func TestHealthCredentialLoadFailureBecomesUnknown(t *testing.T) {
+	for _, prior := range []string{"valid", "rejected"} {
+		t.Run(prior, func(t *testing.T) {
+			now := time.Now()
+			s, _ := newHealthStore(t.TempDir(), func() time.Time { return now })
+			creds := CodexCredentials{AccessToken: "token"}
+			var err error
+			if prior == "rejected" {
+				err = &HTTPStatusError{Code: 401}
+			}
+			s.observe("acct", creds, "monitor", "usage", Snapshot{}, err)
+			old := s.snapshot()[healthHash("acct")]
+			now = now.Add(time.Minute)
+			s.credentialUnavailable("acct", now)
+			got := s.snapshot()[healthHash("acct")]
+			if got.State != "unknown" || got.Code != "credential_unavailable" || !got.LastChecked.Equal(old.LastChecked) || !got.LastAttempt.Equal(now) {
+				t.Fatalf("missing unknown status: %+v", got)
+			}
+			if prior == "valid" && !got.LastSuccess.Equal(old.LastSuccess) {
+				t.Fatal("last success lost")
+			}
+			if prior == "rejected" && (!got.LastRejected.Equal(old.LastRejected) || !got.PendingRecovery) {
+				t.Fatal("rejection history lost")
+			}
+		})
+	}
+}
+
+func TestHealthRecordsActualVerificationOutcome(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		credits Snapshot
+		usage   Snapshot
+		err     error
+		want    string
+	}{
+		{name: "verified", credits: Snapshot{AvailableCount: 1}, usage: Snapshot{WeeklyPct: 100}, want: "verified"},
+		{name: "partial", credits: Snapshot{AvailableCount: 1}, usage: Snapshot{WeeklyPct: 20}, want: "partial"},
+		{name: "mismatch", credits: Snapshot{AvailableCount: 2}, usage: Snapshot{WeeklyPct: 100}, want: "mismatch"},
+		{name: "error", err: errors.New("secret error"), want: "error"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := newHealthStore(t.TempDir(), time.Now)
+			creds := CodexCredentials{AccessToken: "secret"}
+			c := &observedClient{inner: &verificationFake{credits: tc.credits, usage: tc.usage, err: tc.err}, store: s, id: "account", source: "autoreset", phase: "VERIFYING"}
+			f := NewAccountFSM("account", creds, DefaultConfig(), c, time.Now, nil)
+			f.state = StateVERIFYING
+			f.attempt = ResetAttempt{TargetCreditID: "sensitive-id", PreSnapshot: Snapshot{AvailableCount: 2, WeeklyPct: 20}}
+			f.Step()
+			files, _ := filepath.Glob(filepath.Join(s.dir, "health-*.jsonl"))
+			raw, _ := os.ReadFile(files[0])
+			if !strings.Contains(string(raw), `"operation":"verification"`) || !strings.Contains(string(raw), `"result":"`+tc.want+`"`) {
+				t.Fatalf("missing decision: %s", raw)
+			}
+			if strings.Contains(string(raw), "sensitive-id") || strings.Contains(string(raw), "secret error") {
+				t.Fatal("private details leaked")
+			}
+		})
+	}
+}
+
+type verificationFake struct {
+	credits, usage Snapshot
+	err            error
+}
+
+func (f *verificationFake) ListCredits(CodexCredentials) (Snapshot, error) { return f.credits, f.err }
+func (f *verificationFake) GetUsage(CodexCredentials) (Snapshot, error)    { return f.usage, f.err }
+func (f *verificationFake) Consume(CodexCredentials, string, string) (ConsumeResponse, error) {
+	panic("unexpected consume")
 }

@@ -386,6 +386,7 @@ func (f *AccountFSM) stepRESETTING() time.Time {
 func (f *AccountFSM) stepVERIFYING() time.Time {
 	credits, err := f.Client.ListCredits(f.Creds)
 	if err != nil {
+		f.recordVerification("error")
 		f.state = StateDONE
 		f.log("error", fmt.Sprintf("verification failed: %v", err), "abandon", nil,
 			map[string]any{"redeem_request_id": f.attempt.RedeemRequestID, "target_credit_id": f.attempt.TargetCreditID})
@@ -393,6 +394,7 @@ func (f *AccountFSM) stepVERIFYING() time.Time {
 	}
 	usage, err := f.Client.GetUsage(f.Creds)
 	if err != nil {
+		f.recordVerification("error")
 		f.state = StateDONE
 		f.log("error", fmt.Sprintf("verification failed: %v", err), "abandon", nil,
 			map[string]any{"redeem_request_id": f.attempt.RedeemRequestID, "target_credit_id": f.attempt.TargetCreditID})
@@ -431,6 +433,7 @@ func (f *AccountFSM) stepVERIFYING() time.Time {
 
 	switch {
 	case success:
+		f.recordVerification("verified")
 		f.log("info",
 			fmt.Sprintf("reset verified OK: credits %d→%d, weekly %d%%→%d%%, target %s consumed",
 				f.attempt.PreSnapshot.AvailableCount, credits.AvailableCount,
@@ -438,12 +441,14 @@ func (f *AccountFSM) stepVERIFYING() time.Time {
 				shortID(f.attempt.TargetCreditID)),
 			"cycle complete", nil, details)
 	case targetGone && countDown1:
+		f.recordVerification("partial")
 		f.log("warn",
 			fmt.Sprintf("reset PARTIAL: credits %d→%d ok but weekly %d%%→%d%% (delayed recovery?)",
 				f.attempt.PreSnapshot.AvailableCount, credits.AvailableCount,
 				f.attempt.PreSnapshot.WeeklyPct, usage.WeeklyPct),
 			"cycle complete", nil, details)
 	default:
+		f.recordVerification("mismatch")
 		f.log("error",
 			fmt.Sprintf("reset MISMATCH: target_gone=%v count_down_1=%v quota_recovered=%v — halted, no compensating request",
 				targetGone, countDown1, quotaUp),
@@ -463,6 +468,15 @@ func (f *AccountFSM) stepVERIFYING() time.Time {
 	}
 
 	return time.Time{}
+}
+
+// recordVerification observes the FSM decision without changing redemption behavior.
+func (f *AccountFSM) recordVerification(result string) {
+	if observer, ok := f.Client.(interface {
+		recordVerification(CodexCredentials, string)
+	}); ok {
+		observer.recordVerification(f.Creds, result)
+	}
 }
 
 // Reset returns a DONE FSM to IDLE for the next patrol cycle. Called by the

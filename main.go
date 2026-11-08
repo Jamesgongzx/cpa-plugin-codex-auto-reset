@@ -337,17 +337,22 @@ func configurePlugin(raw []byte) error {
 	}
 	healthDir := filepath.Join(filepath.Dir(statePath), "auth-health")
 	store := globalHealthStore.Load()
+	var healthErr error
 	if store == nil || store.dir != healthDir {
-		var healthErr error
 		store, healthErr = newHealthStore(healthDir, time.Now)
-		if healthErr != nil {
-			return fmt.Errorf("auth health initialization: %w", healthErr)
-		}
 	}
-	globalHealthStore.Store(store)
-	monitor := newHealthMonitor(store, listCodexAuthIDs, rawHostCredsLoader)
-	globalHealthMonitor = monitor
-	go monitor.run()
+	var monitor *healthMonitor
+	if healthErr != nil {
+		// Diagnostic evidence is optional. Preserve unreadable evidence and let
+		// reset scheduling continue; the next reconfiguration retries initialization.
+		globalHealthStore.Store(nil)
+		fmt.Fprintln(os.Stderr, "codex-auto-reset: auth health evidence unavailable; reset scheduling continues")
+	} else {
+		globalHealthStore.Store(store)
+		monitor = newHealthMonitor(store, listCodexAuthIDs, rawHostCredsLoader)
+		globalHealthMonitor = monitor
+		go monitor.run()
+	}
 
 	// Stop any prior worker, start a fresh one with the resolved config + accounts.
 	if globalWorker != nil {
@@ -401,6 +406,7 @@ func configurePlugin(raw []byte) error {
 	}
 	globalHandlers.mu.Lock()
 	globalHandlers.health = monitor
+	globalHandlers.healthUnavailable = healthErr != nil
 	globalHandlers.mu.Unlock()
 	globalHandlers.lister = listCodexAccountsForUI
 	globalHandlers.OnSettingsChanged = restartWorkerFromState
@@ -682,12 +688,14 @@ func hostCredsLoader(authID string) (CodexCredentials, ResetClient, error) {
 	}
 	for _, a := range auths {
 		if a.ID == authID || a.AuthIndex == authID {
+			acquired := time.Now()
 			creds, client, err := rawHostCredsLoader(a.ID)
 			if err != nil {
 				return creds, client, err
 			}
 			if store := globalHealthStore.Load(); store != nil {
-				return creds, &observedClient{inner: client, store: store, id: a.ID, source: "autoreset"}, nil
+				store.beginGeneration(a.ID, creds, acquired)
+				return creds, &observedClient{inner: client, store: store, id: a.ID, source: "autoreset", acquired: acquired}, nil
 			}
 			return creds, client, nil
 		}

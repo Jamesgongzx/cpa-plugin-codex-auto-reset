@@ -20,26 +20,27 @@ const healthRetention = 14 * 24 * time.Hour
 const healthMaxBytes = 128 << 20
 
 type healthSummary struct {
-	Generation            string    `json:"generation"`
-	State                 string    `json:"state"`
-	Code                  string    `json:"code"`
-	LastChecked           time.Time `json:"last_checked"`
-	LastAttempt           time.Time `json:"last_attempt"`
-	LastRejected          time.Time `json:"last_rejected"`
-	LastSuccess           time.Time `json:"last_success"`
-	LastSuccessGeneration string    `json:"last_success_generation,omitempty"`
-	FirstRejected         time.Time `json:"first_rejected"`
-	LastRecovered         time.Time `json:"last_recovered"`
-	PendingRecovery       bool      `json:"pending_recovery,omitempty"`
-	WeeklyRemaining       int       `json:"weekly_remaining"`
-	WeeklyObserved        time.Time `json:"weekly_observed"`
-	WeeklyReset           time.Time `json:"weekly_reset"`
-	CreditsAvailable      int       `json:"credits_available"`
-	CreditsObserved       time.Time `json:"credits_observed"`
-	lastStarted           time.Time
-	lastObservedStarted   time.Time
-	notBefore             time.Time
-	acquisitionFailed     bool
+	Generation             string    `json:"generation"`
+	State                  string    `json:"state"`
+	Code                   string    `json:"code"`
+	LastChecked            time.Time `json:"last_checked"`
+	LastAttempt            time.Time `json:"last_attempt"`
+	LastRejected           time.Time `json:"last_rejected"`
+	LastRejectedGeneration string    `json:"last_rejected_generation,omitempty"`
+	LastSuccess            time.Time `json:"last_success"`
+	LastSuccessGeneration  string    `json:"last_success_generation,omitempty"`
+	FirstRejected          time.Time `json:"first_rejected"`
+	LastRecovered          time.Time `json:"last_recovered"`
+	PendingRecovery        bool      `json:"pending_recovery,omitempty"`
+	WeeklyRemaining        int       `json:"weekly_remaining"`
+	WeeklyObserved         time.Time `json:"weekly_observed"`
+	WeeklyReset            time.Time `json:"weekly_reset"`
+	CreditsAvailable       int       `json:"credits_available"`
+	CreditsObserved        time.Time `json:"credits_observed"`
+	lastStarted            time.Time
+	lastObservedStarted    time.Time
+	notBefore              time.Time
+	acquisitionFailed      bool
 }
 type healthEvent struct {
 	Time       time.Time `json:"time"`
@@ -165,6 +166,13 @@ func (s *healthStore) observeAt(id string, creds CodexCredentials, source, op, p
 	// A different generation is fenced; the same token can be reloaded while
 	// a request is in flight. Order those observations by request start instead.
 	row := s.rows[account]
+	// Preserve every observed 401 as history even when its request is too old
+	// to change the current credential's health.
+	if status == 401 && !now.Before(row.LastRejected) {
+		row.LastRejected = now
+		row.LastRejectedGeneration = gen
+		s.rows[account] = row
+	}
 	if row.Generation == gen && !row.acquisitionFailed && !requestStarted.Before(row.notBefore) && !requestStarted.Before(row.lastObservedStarted) {
 		row.lastObservedStarted = requestStarted
 		row.LastAttempt = now
@@ -185,7 +193,6 @@ func (s *healthStore) observeAt(id string, creds CodexCredentials, source, op, p
 				row.FirstRejected = now
 			}
 			row.State = "rejected"
-			row.LastRejected = now
 		}
 		if row.State == "" {
 			row.State = "unknown"

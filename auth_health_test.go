@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -519,5 +520,46 @@ func TestHealthLoadFailureFencesOlderInFlightObservations(t *testing.T) {
 	s.observeAt("acct", creds, "monitor", "usage", "", "", Snapshot{}, nil, now)
 	if got := s.snapshot()[healthHash("acct")]; got.State != "valid" {
 		t.Fatalf("new successful check not accepted: %+v", got)
+	}
+}
+
+func TestHealthRecordsLateRejectionsWithoutOverridingCurrentState(t *testing.T) {
+	for _, replacement := range []bool{false, true} {
+		t.Run(fmt.Sprintf("replacement=%t", replacement), func(t *testing.T) {
+			dir := t.TempDir()
+			now := time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC)
+			clock := func() time.Time { return now }
+			s, err := newHealthStore(dir, clock)
+			if err != nil {
+				t.Fatal(err)
+			}
+			old := CodexCredentials{AccessToken: "old"}
+			current := old
+			if replacement {
+				current = CodexCredentials{AccessToken: "new"}
+			}
+			firstStarted := now
+			s.beginGeneration("acct", old, firstStarted)
+			now = now.Add(time.Second)
+			s.beginGeneration("acct", current, now)
+			s.observeAt("acct", current, "monitor", "usage", "", "", Snapshot{}, nil, now)
+			now = now.Add(time.Second)
+			s.observeAt("acct", old, "autoreset", "usage", "VERIFYING", "", Snapshot{}, &HTTPStatusError{Code: 401}, firstStarted)
+			row := s.snapshot()[healthHash("acct")]
+			if row.State != "valid" || row.Generation != healthHash(current.AccessToken) || !row.FirstRejected.IsZero() {
+				t.Fatalf("current health changed: %+v", row)
+			}
+			if !row.LastRejected.Equal(now) || row.LastRejectedGeneration != healthHash(old.AccessToken) {
+				t.Fatalf("late rejection not attributed: %+v", row)
+			}
+			reloaded, err := newHealthStore(dir, clock)
+			if err != nil {
+				t.Fatal(err)
+			}
+			row = reloaded.snapshot()[healthHash("acct")]
+			if !row.LastRejected.Equal(now) || row.LastRejectedGeneration != healthHash(old.AccessToken) || row.State != "valid" {
+				t.Fatalf("history did not survive restart: %+v", row)
+			}
+		})
 	}
 }

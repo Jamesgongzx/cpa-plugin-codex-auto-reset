@@ -305,6 +305,10 @@ func (w *Worker) stepAccountSafe(authID string) {
 		return
 	}
 
+	if observed, ok := client.(*observedClient); ok {
+		observed.phase = string(fsm.State())
+	}
+
 	// Set credentials and client under the FSM mutex to avoid data races
 	// with concurrent State()/NextWake() readers.
 	fsm.mu.Lock()

@@ -33,6 +33,7 @@ type managementHandlers struct {
 	state             *PluginState
 	statePath         string
 	worker            *Worker
+	health            *healthMonitor
 	lister            AccountLister // may be nil if host ABI not wired (tests)
 	OnSettingsChanged func()        // injected by main.go; restarts the worker with new config
 }
@@ -157,6 +158,9 @@ func (h *managementHandlers) statusJSON() (int, []byte) {
 		"config":        h.state.Config,
 		"accounts":      accts,
 		"reset_history": history,
+	}
+	if h.health != nil {
+		out["auth_health"] = h.health.status()
 	}
 	return jsonOK(out)
 }

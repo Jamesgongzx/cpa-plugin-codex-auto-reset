@@ -76,8 +76,11 @@ var (
 	// configurePlugin (explicit state_dir > CPA auth dir > OS user-config
 	// dir). All saves go through it so reconfigure cannot split state
 	// across locations.
-	globalStatePath string
-	pluginVersion   = "0.1.14-weekly.1"
+	globalStatePath       string
+	globalHealthLifecycle sync.Mutex
+	globalHealthStore     atomic.Pointer[healthStore]
+	globalHealthMonitor   *healthMonitor
+	pluginVersion         = "0.1.15-health.1"
 )
 
 func main() {}
@@ -127,11 +130,21 @@ func cliproxyPluginFree(ptr unsafe.Pointer, len C.size_t) {
 
 //export cliproxyPluginShutdown
 func cliproxyPluginShutdown() {
+	globalHealthLifecycle.Lock()
+	defer globalHealthLifecycle.Unlock()
 	pluginStateMu.Lock()
 	w := globalWorker
 	pluginStateMu.Unlock()
 	if w != nil {
 		w.Stop()
+	}
+	pluginStateMu.Lock()
+	m := globalHealthMonitor
+	globalHealthMonitor = nil
+	globalHealthStore.Store(nil)
+	pluginStateMu.Unlock()
+	if m != nil {
+		m.stopAndWait()
 	}
 }
 
@@ -263,6 +276,8 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 }
 
 func configurePlugin(raw []byte) error {
+	globalHealthLifecycle.Lock()
+	defer globalHealthLifecycle.Unlock()
 	var req lifecycleRequest
 	if len(raw) > 0 {
 		if err := json.Unmarshal(raw, &req); err != nil {
@@ -314,6 +329,26 @@ func configurePlugin(raw []byte) error {
 	globalState = loaded
 	globalState.Config = cfg
 
+	// The monitor has a separate lifecycle from the reset worker, so changing
+	// enrollment cannot duplicate a monitor or change health-check coverage.
+	if globalHealthMonitor != nil {
+		globalHealthMonitor.stopAndWait()
+		globalHealthMonitor = nil
+	}
+	healthDir := filepath.Join(filepath.Dir(statePath), "auth-health")
+	store := globalHealthStore.Load()
+	if store == nil || store.dir != healthDir {
+		var healthErr error
+		store, healthErr = newHealthStore(healthDir, time.Now)
+		if healthErr != nil {
+			return fmt.Errorf("auth health initialization: %w", healthErr)
+		}
+	}
+	globalHealthStore.Store(store)
+	monitor := newHealthMonitor(store, listCodexAuthIDs, rawHostCredsLoader)
+	globalHealthMonitor = monitor
+	go monitor.run()
+
 	// Stop any prior worker, start a fresh one with the resolved config + accounts.
 	if globalWorker != nil {
 		globalWorker.Stop()
@@ -364,6 +399,9 @@ func configurePlugin(raw []byte) error {
 		globalHandlers.statePath = statePath
 		globalHandlers.worker = globalWorker
 	}
+	globalHandlers.mu.Lock()
+	globalHandlers.health = monitor
+	globalHandlers.mu.Unlock()
 	globalHandlers.lister = listCodexAccountsForUI
 	globalHandlers.OnSettingsChanged = restartWorkerFromState
 	return nil
@@ -610,7 +648,7 @@ func mgmtJSONResponse(status int, v any) pluginapi.ManagementResponse {
 // ABI to (1) list auth files, (2) get the matching one's JSON, (3) extract
 // Codex credentials. Returns an error if the account isn't found or isn't a
 // Codex credential.
-func hostCredsLoader(authID string) (CodexCredentials, ResetClient, error) {
+func rawHostCredsLoader(authID string) (CodexCredentials, ResetClient, error) {
 	auths, err := listAuthsViaHost()
 	if err != nil {
 		return CodexCredentials{}, nil, fmt.Errorf("list auths: %w", err)
@@ -633,6 +671,42 @@ func hostCredsLoader(authID string) (CodexCredentials, ResetClient, error) {
 		return creds, &OpenAIClient{}, nil
 	}
 	return CodexCredentials{}, nil, fmt.Errorf("auth %q not found", authID)
+}
+
+func hostCredsLoader(authID string) (CodexCredentials, ResetClient, error) {
+	// Resolve the host's ID because reset workers use auth_index while routing
+	// evidence hashes ID. Do not persist either raw identifier in health files.
+	auths, err := listAuthsViaHost()
+	if err != nil {
+		return CodexCredentials{}, nil, err
+	}
+	for _, a := range auths {
+		if a.ID == authID || a.AuthIndex == authID {
+			creds, client, err := rawHostCredsLoader(a.ID)
+			if err != nil {
+				return creds, client, err
+			}
+			if store := globalHealthStore.Load(); store != nil {
+				return creds, &observedClient{inner: client, store: store, id: a.ID, source: "autoreset"}, nil
+			}
+			return creds, client, nil
+		}
+	}
+	return CodexCredentials{}, nil, fmt.Errorf("credential unavailable")
+}
+func listCodexAuthIDs() ([]string, error) {
+	auths, err := listAuthsViaHost()
+	if err != nil {
+		return nil, err
+	}
+	ids := []string{}
+	for _, a := range auths {
+		if a.ID != "" && (strings.EqualFold(a.Provider, "codex") || strings.EqualFold(a.Type, "codex")) {
+			ids = append(ids, a.ID)
+		}
+	}
+	sort.Strings(ids)
+	return ids, nil
 }
 
 func listAuthsViaHost() ([]pluginapi.HostAuthFileEntry, error) {

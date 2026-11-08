@@ -105,7 +105,11 @@ func (c *OpenAIClient) ListCredits(creds CodexCredentials) (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, err
 	}
-	return parseResetCreditsResponse(body, time.Now())
+	snap, err := parseResetCreditsResponse(body, time.Now())
+	if err != nil {
+		return snap, &InvalidResponseError{Err: err}
+	}
+	return snap, nil
 }
 
 // GetUsage calls GET /backend-api/wham/usage.
@@ -121,7 +125,11 @@ func (c *OpenAIClient) GetUsage(creds CodexCredentials) (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, err
 	}
-	return parseUsageResponse(body, time.Now())
+	snap, err := parseUsageResponse(body, time.Now())
+	if err != nil {
+		return snap, &InvalidResponseError{Err: err}
+	}
+	return snap, nil
 }
 
 // Consume calls POST /backend-api/wham/rate-limit-reset-credits/consume with
@@ -158,7 +166,11 @@ func (c *OpenAIClient) Consume(creds CodexCredentials, redeemRequestID, creditID
 	if err != nil {
 		return ConsumeResponse{}, err
 	}
-	return parseConsumeResponse(body)
+	result, err := parseConsumeResponse(body)
+	if err != nil {
+		return result, &InvalidResponseError{Err: err}
+	}
+	return result, nil
 }
 
 // Endpoint paths are constants relative to BaseURL. The production BaseURL is

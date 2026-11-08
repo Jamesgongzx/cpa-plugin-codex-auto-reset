@@ -128,6 +128,38 @@ already must, for credentials) is enough, e.g.
 `-v ./cpa/auths:/root/.cli-proxy-api`. No access tokens or credential
 material are persisted in the state file.
 
+## Authentication observation
+
+In addition to the reset patrol, the plugin makes one read-only usage GET per
+host Codex account immediately at startup and then every 15 minutes. This is
+independent of reset enrollment. It never logs in or out, refreshes a token, or
+redeems a credit. A bounded network timeout applies; a slow or offline host can
+delay the next observation. Authentication checks are observations, not an
+assertion of the exact provider-side revocation time or reason. A 401 signals
+a rejected token, a 403 signals a permission error, and network errors or
+quota limits do not by themselves mean authentication was revoked. A malformed
+2xx body is recorded as invalid response, with authentication accepted.
+
+The authenticated management status response contains `auth_health` with the
+monitor state, interval, last cycle, and redacted per-account last check,
+last successful authentication, first observed rejection, recovery, and
+last-known weekly and credit facts with observation times. The host's own
+routing eligibility is independent and may be stale. A new credential
+fingerprint starts in unknown state until an observation for it succeeds.
+Old facts retain their original observation time.
+
+Private `auth-health/` under the plugin state directory contains a durable
+summary and append-only segmented observations. Account keys are SHA-256 of
+the same host credential ID used by reset-aware-routing's journal, enabling
+correlation with its selections, usage, and switches. The separately hashed
+access-token generation only distinguishes credential replacement; no token,
+raw response, request body, account ID, or provider error prose is stored.
+AutoReset events include the endpoint, safe HTTP status and code, source,
+reset FSM phase and allowlisted consume result. The journal is pruned after
+14 days or 128 MiB, whichever occurs first; a write failure is reported to
+stderr. It cannot observe requests made directly by other tools, and the
+routing journal remains the source for model use and conversation switches.
+
 ## Installation
 
 Download the zip for your platform from the latest GitHub release:

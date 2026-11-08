@@ -1,11 +1,11 @@
 # Retain account authentication checks and reset activity
 
-Status: validate
+Status: done
 Owner: ai
 Category: tooling
 Created: 2026-11-08
 Updated: 2026-11-08
-Completed: none
+Completed: 2026-11-08
 
 ## Outcome
 
@@ -44,7 +44,7 @@ Not required. Technical review and live delivery evidence required.
 
 ## Current State
 
-Implementation and independent review passed. Accepted AutoReset source is 2af81532ff22cf22b12c1ddacb23622360135ca4, version 0.1.15-health.1; exact native artifact hash be4e4e7baf217eaddbd567c3dd8ef1652cc280f54e2f91fdc6b37163e9ebfac7. The exact-plugin isolated native smoke passed. Router activation and smoke tooling from codex/auth-observability-activation was fast-forwarded into main and freshly verified on origin/main at 2b0eac6fb9817e3bf3e18484f043f045f0220761. AutoReset main publication and supervised live installation remain.
+Complete. Accepted AutoReset source 2af81532ff22cf22b12c1ddacb23622360135ca4 is installed as 0.1.15-health.1, exact library SHA-256 be4e4e7baf217eaddbd567c3dd8ef1652cc280f54e2f91fdc6b37163e9ebfac7. The live monitor checked all five accounts successfully and runs every 15 minutes. Credentials, all 45 conversation bindings, reset config/history and Herdr process identities were preserved. Ongoing same-session/same-account model usage succeeded after activation. Both source repositories are integrated and published; this closure is a documentation-only descendant.
 
 ## Documentation Impact
 
@@ -68,6 +68,15 @@ Independent reports review-health-01.md and review-health-02.md retain rejected 
 Activation reports review-activation-01.md through review-activation-03.md retain configuration/plist drift and smoke-contract corrections. Exact candidate 2b0eac6 is accepted with 55 Python checks. Native-before.json records the old plugin failing the new health contract as expected; native-smoke-v2.json verifies f46c343 native registration, version, authenticated health status, empty account map, 15-minute cadence, no provider calls and clean shutdown.
 
 Activation idle checks cover reported existing bindings only, not a global atomic request fence. New requests can arrive after the check. Supervised recovery preserves session ownership and restores only the prior plugin on failure, never credentials or reset state.
+
+### Delivery and live verification
+
+- AutoReset `codex/auth-observability` was fast-forwarded into `main`; `origin/main` was freshly checked at 6883dd044a612f8733fa2172df1bcfded06df39b, containing accepted implementation 2af8153 with only task documentation added.
+- Router `codex/auth-observability-activation` was fast-forwarded into `main`; `origin/main` was freshly checked at 2b0eac6fb9817e3bf3e18484f043f045f0220761. Existing host and routing library were unchanged at runtime.
+- Supervised plugin-only activation completed with stage `healthy` and no error. Receipt: `~/.local/state/mac-setup/2026-10-31/proxy-staging/runtime/activation-control/activation-gq_i7jw5/receipt.json`. The temporary controller job was removed after completion; private plugin rollback material and receipts remain.
+- `live-verification.json` at 2026-11-08T21:50:27Z confirms exact installed hashes, version, running 15m monitor, no monitor error, five valid account health entries and new monitor/AutoReset GET events. Health files are 0600 in a 0700 directory. No provider failure, quota exhaustion, token refresh or credit consumption was induced. The second periodic live cycle was not waited out; the synthetic cadence tests plus running first live cycle establish scheduling and startup operation.
+- `preservation-comparison.json` verifies identical downloaded credential digests for all five accounts, reset configuration/history, all 45 binding identities and Herdr process identities before/after activation. `continuity.json` identifies five successful real model usages after activation with the same sessions and accounts as before it. It does not claim the brief proxy replacement was an atomic traffic handoff.
+- All C1-C5 criteria are satisfied. Real redemption, revoked-token recovery and deliberate fault injection were tested synthetically, not against the user's accounts. Full and focused race tests, vet, build, 55 activation/smoke tests, exact native compatibility and independent review passed.
 
 ## Dependencies And Risks
 

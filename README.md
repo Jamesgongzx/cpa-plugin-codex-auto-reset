@@ -2,7 +2,7 @@
 
 ## Owner weekly metadata variant
 
-The reviewed owner build `0.1.14-weekly.1` is based on official 0.1.14 at `a26b99522261ed588c053c005e35dde34ee4097f`. The earlier canceled reset-attempt behavior was reverted by `1fd4f02a4bc17d08fb5de9b61b96a81eb6a7a23e` and remains absent. This variant only retains `weekly_reset_at`, `weekly_window_seconds` and `weekly_observed_at` from the existing generation-usage GET in `Snapshot`, then carries those fields through existing patrol/confirm/verify persistence. Code-review windows and missing or invalid reset data do not become generation weekly facts.
+The current owner build `0.1.15-health.1` adds authentication observation to the reviewed `0.1.14-weekly.1` baseline, which is based on official 0.1.14 at `a26b99522261ed588c053c005e35dde34ee4097f`. The earlier canceled reset-attempt behavior was reverted by `1fd4f02a4bc17d08fb5de9b61b96a81eb6a7a23e` and remains absent. That weekly-metadata baseline retains `weekly_reset_at`, `weekly_window_seconds` and `weekly_observed_at` from the existing generation-usage GET in `Snapshot`, then carries those fields through existing patrol/confirm/verify persistence. Code-review windows and missing or invalid reset data do not become generation weekly facts.
 
 No provider call, polling schedule, credential handling, consume logic, retry behavior or reset-history rule is added or changed. The router consumes the existing state file read only, joining the account keys by the host's auth index. A normal existing patrol is required after replacement before fresh weekly facts exist. Keep the same state location, persisted monitored-account indexes and settings. Only one AutoReset instance should consume credits. The private deployment bundle pins this build and contains exact stopped-state installation, rollback and independent acceptance evidence; it is not an official upstream release.
 
@@ -152,7 +152,12 @@ in the historical summary: join hashes against the current host account list
 and check observation times rather than treating every stored entry as current.
 `first_rejected` applies to the current credential generation;
 `pending_recovery` preserves an earlier rejected episode across a replacement
-until the replacement is successfully checked.
+until the replacement is successfully checked. Historical `last_rejected` and
+`last_rejected_generation` record every observed 401, including late responses
+that cannot change current health. They identify a local observation, not the
+provider revocation time. Weekly and credit counts are unknown when their
+corresponding observation timestamp is zero; numeric zero alone is not evidence
+of exhaustion.
 
 Private `auth-health/` under the plugin state directory contains a durable
 summary and append-only segmented observations. Account keys are SHA-256 of

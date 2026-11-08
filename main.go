@@ -276,6 +276,12 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 }
 
 func configurePlugin(raw []byte) error {
+	return configurePluginWithMigration(raw, migrateLegacyState, defaultStatePath())
+}
+
+// Migration paths are supplied by the caller, which also allows isolated
+// synthetic configuration tests without touching the user's home directory.
+func configurePluginWithMigration(raw []byte, migrateLegacy func(string), previousStatePath string) error {
 	globalHealthLifecycle.Lock()
 	defer globalHealthLifecycle.Unlock()
 	var req lifecycleRequest
@@ -306,8 +312,8 @@ func configurePlugin(raw []byte) error {
 	globalStatePath = statePath
 	// Forward migrations from superseded locations. Each runs at most once;
 	// sources are kept as .migrated, never destroyed.
-	migrateLegacyState(statePath)                   // pre-0.1.7 CWD-relative file
-	migrateStateFile(defaultStatePath(), statePath) // 0.1.7+ OS user-config dir
+	migrateLegacy(statePath)                       // pre-0.1.7 CWD-relative file
+	migrateStateFile(previousStatePath, statePath) // 0.1.7+ OS user-config dir
 	loaded, source, err := loadState(statePath)
 	if err != nil {
 		// Start empty but treat persistence as suspect: log loudly so the

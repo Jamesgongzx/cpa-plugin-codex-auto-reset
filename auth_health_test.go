@@ -281,7 +281,7 @@ func TestHealthFailureDoesNotDisableResetConfiguration(t *testing.T) {
 	for _, kind := range []string{"malformed_summary", "invalid_directory"} {
 		t.Run(kind, func(t *testing.T) {
 			root := t.TempDir()
-			t.Setenv("HOME", t.TempDir())
+			// Explicit state and migration paths keep the user's home untouched.
 			healthPath := filepath.Join(root, "auth-health")
 			if kind == "malformed_summary" {
 				if err := os.Mkdir(healthPath, 0700); err != nil {
@@ -296,7 +296,7 @@ func TestHealthFailureDoesNotDisableResetConfiguration(t *testing.T) {
 				}
 			}
 			raw, _ := json.Marshal(lifecycleRequest{ConfigYAML: []byte("state_dir: " + root + "\nenabled_accounts: []\n")})
-			if err := configurePlugin(raw); err != nil {
+			if err := configurePluginWithMigration(raw, func(string) {}, filepath.Join(root, "absent-legacy-state.json")); err != nil {
 				t.Fatalf("diagnostics stopped reset configuration: %v", err)
 			}
 			t.Cleanup(cliproxyPluginShutdown)
@@ -337,7 +337,7 @@ func TestHealthFailureDoesNotDisableResetConfiguration(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if err := configurePlugin(raw); err != nil {
+			if err := configurePluginWithMigration(raw, func(string) {}, filepath.Join(root, "absent-legacy-state.json")); err != nil {
 				t.Fatalf("repair reconfiguration failed: %v", err)
 			}
 			if globalHandlers.health == nil || globalHandlers.healthUnavailable {
@@ -475,4 +475,49 @@ func (f *verificationFake) ListCredits(CodexCredentials) (Snapshot, error) { ret
 func (f *verificationFake) GetUsage(CodexCredentials) (Snapshot, error)    { return f.usage, f.err }
 func (f *verificationFake) Consume(CodexCredentials, string, string) (ConsumeResponse, error) {
 	panic("unexpected consume")
+}
+
+func TestHealthSameCredentialReacquiredDoesNotHideLaterRejection(t *testing.T) {
+	now := time.Now()
+	s, _ := newHealthStore(t.TempDir(), func() time.Time { return now })
+	creds := CodexCredentials{AccessToken: "same"}
+	first := now
+	s.beginGeneration("acct", creds, first)
+	now = now.Add(time.Second)
+	s.beginGeneration("acct", creds, now)
+	s.observeAt("acct", creds, "monitor", "usage", "", "", Snapshot{}, nil, now)
+	now = now.Add(time.Second)
+	s.observeAt("acct", creds, "autoreset", "usage", "VERIFYING", "", Snapshot{}, &HTTPStatusError{Code: 401}, now)
+	row := s.snapshot()[healthHash("acct")]
+	if row.State != "rejected" {
+		t.Fatalf("current token rejection was lost after same-token reload: %+v", row)
+	}
+	// A response from an earlier-started request must not erase the later rejection.
+	now = now.Add(time.Second)
+	s.observeAt("acct", creds, "monitor", "usage", "", "", Snapshot{}, nil, first)
+	if row = s.snapshot()[healthHash("acct")]; row.State != "rejected" {
+		t.Fatalf("stale success erased rejection: %+v", row)
+	}
+}
+
+func TestHealthLoadFailureFencesOlderInFlightObservations(t *testing.T) {
+	now := time.Now()
+	s, _ := newHealthStore(t.TempDir(), func() time.Time { return now })
+	creds := CodexCredentials{AccessToken: "same"}
+	requestStart := now
+	s.beginGeneration("acct", creds, now)
+	s.observeAt("acct", creds, "monitor", "usage", "", "", Snapshot{}, nil, now)
+	now = now.Add(time.Second)
+	s.credentialUnavailable("acct", now)
+	now = now.Add(time.Second)
+	s.beginGeneration("acct", creds, now)
+	s.observeAt("acct", creds, "autoreset", "usage", "", "", Snapshot{}, nil, requestStart)
+	if got := s.snapshot()[healthHash("acct")]; got.State != "unknown" {
+		t.Fatalf("old in-flight success hid credential load failure: %+v", got)
+	}
+	now = now.Add(time.Second)
+	s.observeAt("acct", creds, "monitor", "usage", "", "", Snapshot{}, nil, now)
+	if got := s.snapshot()[healthHash("acct")]; got.State != "valid" {
+		t.Fatalf("new successful check not accepted: %+v", got)
+	}
 }

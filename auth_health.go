@@ -37,6 +37,9 @@ type healthSummary struct {
 	CreditsAvailable      int       `json:"credits_available"`
 	CreditsObserved       time.Time `json:"credits_observed"`
 	lastStarted           time.Time
+	lastObservedStarted   time.Time
+	notBefore             time.Time
+	acquisitionFailed     bool
 }
 type healthEvent struct {
 	Time       time.Time `json:"time"`
@@ -147,6 +150,9 @@ func (s *healthStore) observe(id string, creds CodexCredentials, source, op stri
 	s.observeStarted(id, creds, source, op, "", "", snap, err, acquired)
 }
 func (s *healthStore) observeStarted(id string, creds CodexCredentials, source, op, phase, result string, snap Snapshot, err error, started time.Time) {
+	s.observeAt(id, creds, source, op, phase, result, snap, err, started)
+}
+func (s *healthStore) observeAt(id string, creds CodexCredentials, source, op, phase, result string, snap Snapshot, err error, requestStarted time.Time) {
 	code, status := classifyHealth(err)
 	now := s.now().UTC()
 	account, gen := healthHash(id), healthHash(creds.AccessToken)
@@ -156,9 +162,11 @@ func (s *healthStore) observeStarted(id string, creds CodexCredentials, source, 
 	ev := healthEvent{Time: now, Account: account, Generation: gen, Source: source, Operation: op, Phase: phase, Code: code, HTTPStatus: status, Result: result}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// Only the latest credential acquisition may update current health.
+	// A different generation is fenced; the same token can be reloaded while
+	// a request is in flight. Order those observations by request start instead.
 	row := s.rows[account]
-	if !started.Before(row.lastStarted) && row.Generation == gen {
+	if row.Generation == gen && !row.acquisitionFailed && !requestStarted.Before(row.notBefore) && !requestStarted.Before(row.lastObservedStarted) {
+		row.lastObservedStarted = requestStarted
 		row.LastAttempt = now
 		row.LastChecked = now
 		row.Code = code
@@ -217,7 +225,13 @@ func (s *healthStore) beginGeneration(id string, creds CodexCredentials, acquire
 		return
 	}
 	row.lastStarted = acquired
+	if row.acquisitionFailed {
+		row.notBefore = acquired
+		row.acquisitionFailed = false
+	}
 	if row.Generation != gen {
+		row.notBefore = acquired
+		row.lastObservedStarted = time.Time{}
 		row.PendingRecovery = row.PendingRecovery || row.State == "rejected"
 		row.Generation = gen
 		row.State = "unknown"
@@ -241,6 +255,8 @@ func (s *healthStore) credentialUnavailable(id string, acquired time.Time) {
 	row := s.rows[account]
 	if !acquired.Before(row.lastStarted) {
 		row.lastStarted = acquired
+		row.acquisitionFailed = true
+		row.notBefore = acquired
 		row.PendingRecovery = row.PendingRecovery || row.State == "rejected"
 		row.LastAttempt = now
 		row.Code = "credential_unavailable"
@@ -359,8 +375,9 @@ func (c *observedClient) GetUsage(creds CodexCredentials) (Snapshot, error) {
 		start = time.Now()
 		c.store.beginGeneration(c.id, creds, start)
 	}
+	requestStarted := time.Now()
 	v, err := c.inner.GetUsage(creds)
-	c.store.observeStarted(c.id, creds, c.source, "usage", c.phase, "", v, err, start)
+	c.store.observeAt(c.id, creds, c.source, "usage", c.phase, "", v, err, requestStarted)
 	return v, err
 }
 func (c *observedClient) ListCredits(creds CodexCredentials) (Snapshot, error) {
@@ -369,8 +386,9 @@ func (c *observedClient) ListCredits(creds CodexCredentials) (Snapshot, error) {
 		start = time.Now()
 		c.store.beginGeneration(c.id, creds, start)
 	}
+	requestStarted := time.Now()
 	v, err := c.inner.ListCredits(creds)
-	c.store.observeStarted(c.id, creds, c.source, "credits", c.phase, "", v, err, start)
+	c.store.observeAt(c.id, creds, c.source, "credits", c.phase, "", v, err, requestStarted)
 	return v, err
 }
 func (c *observedClient) recordVerification(creds CodexCredentials, result string) {
@@ -396,13 +414,14 @@ func (c *observedClient) Consume(creds CodexCredentials, rid, cid string) (Consu
 		start = time.Now()
 		c.store.beginGeneration(c.id, creds, start)
 	}
+	requestStarted := time.Now()
 	v, err := c.inner.Consume(creds, rid, cid)
 	result := ""
 	switch v.Code {
 	case ConsumeCodeReset, ConsumeCodeAlreadyRedeemed, ConsumeCodeNoCredit, ConsumeCodeNothingToReset:
 		result = string(v.Code)
 	}
-	c.store.observeStarted(c.id, creds, c.source, "consume", c.phase, result, Snapshot{}, err, start)
+	c.store.observeAt(c.id, creds, c.source, "consume", c.phase, result, Snapshot{}, err, requestStarted)
 	return v, err
 }
 

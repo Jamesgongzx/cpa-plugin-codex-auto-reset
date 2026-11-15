@@ -6,6 +6,8 @@ The current owner build `0.1.15-health.1` adds authentication observation to the
 
 No provider call, polling schedule, credential handling, consume logic, retry behavior or reset-history rule is added or changed. The router consumes the existing state file read only, joining the account keys by the host's auth index. A normal existing patrol is required after replacement before fresh weekly facts exist. Keep the same state location, persisted monitored-account indexes and settings. Only one AutoReset instance should consume credits. The private deployment bundle pins this build and contains exact stopped-state installation, rollback and independent acceptance evidence; it is not an official upstream release.
 
+The reserve metadata variant also retains nullable, exact `generation_weekly_remaining_pct` from that same generation weekly window. Missing, invalid and code-review-only usage stays unknown. The legacy rounded `weekly_pct` remains unchanged for existing reset behavior and must not be used as proof for a reserve. Existing patrol/confirm/verify copies and persists the added value without another request or refresh owner. The [recovery and reserve task](https://github.com/Jamesgongzx/cliproxy-reset-aware-routing/blob/main/docs/tasks/2026-11-14-recovery-and-reserve.md) owns source acceptance and the separately approved restart.
+
 `codex-auto-reset` is a CLIProxyAPI (CPA) dynamic library plugin that
 automatically redeems the soonest-expiring Codex "Reset Bank" credit on each
 enabled account before it expires, so no credit is ever lost to forgetfulness.

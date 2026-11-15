@@ -33,9 +33,10 @@ type Snapshot struct {
 	WeeklyPct      int       `json:"weekly_pct"`
 	CapturedAt     time.Time `json:"captured_at"`
 	// Weekly metadata is observed by the existing usage GET, independently of credits.
-	WeeklyResetAt       time.Time `json:"weekly_reset_at,omitzero"`
-	WeeklyWindowSeconds int       `json:"weekly_window_seconds,omitempty"`
-	WeeklyObservedAt    time.Time `json:"weekly_observed_at,omitzero"`
+	WeeklyResetAt             time.Time `json:"weekly_reset_at,omitzero"`
+	WeeklyWindowSeconds       int       `json:"weekly_window_seconds,omitempty"`
+	WeeklyObservedAt          time.Time `json:"weekly_observed_at,omitzero"`
+	GenerationWeeklyRemaining *float64  `json:"generation_weekly_remaining_pct,omitempty"`
 }
 
 func (s Snapshot) withUsage(usage Snapshot) Snapshot {
@@ -43,6 +44,7 @@ func (s Snapshot) withUsage(usage Snapshot) Snapshot {
 	s.WeeklyResetAt = usage.WeeklyResetAt
 	s.WeeklyWindowSeconds = usage.WeeklyWindowSeconds
 	s.WeeklyObservedAt = usage.WeeklyObservedAt
+	s.GenerationWeeklyRemaining = usage.GenerationWeeklyRemaining
 	return s
 }
 

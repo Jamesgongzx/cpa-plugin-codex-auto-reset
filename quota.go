@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"time"
 )
 
@@ -131,21 +132,22 @@ func parseUsageResponse(raw []byte, now time.Time) (Snapshot, error) {
 		}
 	}
 
-	weeklyResetAt, weeklyWindowSeconds, weeklyObservedAt := routingWeeklyMetadata(doc, now)
+	weeklyResetAt, weeklyWindowSeconds, weeklyObservedAt, remaining := routingWeeklyMetadata(doc, now)
 	return Snapshot{
-		AvailableCount:      availableCount,
-		WeeklyPct:           weeklyPct,
-		CapturedAt:          now,
-		WeeklyResetAt:       weeklyResetAt,
-		WeeklyWindowSeconds: weeklyWindowSeconds,
-		WeeklyObservedAt:    weeklyObservedAt,
+		AvailableCount:            availableCount,
+		WeeklyPct:                 weeklyPct,
+		CapturedAt:                now,
+		WeeklyResetAt:             weeklyResetAt,
+		WeeklyWindowSeconds:       weeklyWindowSeconds,
+		WeeklyObservedAt:          weeklyObservedAt,
+		GenerationWeeklyRemaining: remaining,
 	}, nil
 }
 
 // routingWeeklyMetadata retains only the generation quota's weekly window.
 // Code-review limits are a different allowance. This does not change the
 // existing weekly-percent parser or any reset transition or provider request.
-func routingWeeklyMetadata(doc map[string]any, now time.Time) (time.Time, int, time.Time) {
+func routingWeeklyMetadata(doc map[string]any, now time.Time) (time.Time, int, time.Time, *float64) {
 	rl, ok := getMapAny(doc, "rate_limit", "rateLimit")
 	if ok {
 		for _, key := range []string{"primary_window", "primaryWindow", "secondary_window", "secondaryWindow"} {
@@ -160,11 +162,16 @@ func routingWeeklyMetadata(doc map[string]any, now time.Time) (time.Time, int, t
 			}
 			at := time.Unix(int64(reset), 0).UTC()
 			if at.After(now) && at.Sub(now) <= time.Duration(seconds)*time.Second+time.Hour {
-				return at, seconds, now
+				var remaining *float64
+				if used, known := getFloatAny(win, "used_percent", "usedPercent"); known && !math.IsNaN(used) && !math.IsInf(used, 0) && used >= 0 && used <= 100 {
+					value := 100 - used
+					remaining = &value
+				}
+				return at, seconds, now, remaining
 			}
 		}
 	}
-	return time.Time{}, 0, time.Time{}
+	return time.Time{}, 0, time.Time{}, nil
 }
 
 // --- flexible map helpers (mirror codex-quota-scheduler's getMap/getInt/getFloat64) ---

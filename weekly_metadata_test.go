@@ -28,6 +28,54 @@ func TestUsageRetainsWeeklyRoutingMetadata(t *testing.T) {
 	}
 }
 
+func TestGenerationWeeklyRemainingRetainsExactQualifiedValue(t *testing.T) {
+	now := time.Date(2030, 1, 1, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name   string
+		used   any
+		review bool
+		want   *float64
+	}{
+		{name: "fraction above reserve", used: 79.99, want: floatPointer(20.01)},
+		{name: "at reserve", used: 80.0, want: floatPointer(20)},
+		{name: "unknown"},
+		{name: "invalid", used: 101.0},
+		{name: "review is separate", used: 10.0, review: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			window := map[string]any{"limit_window_seconds": 604800, "reset_at": now.Add(time.Hour).Unix()}
+			if tc.used != nil {
+				window["used_percent"] = tc.used
+			}
+			key := "rate_limit"
+			if tc.review {
+				key = "code_review_rate_limit"
+			}
+			raw, _ := json.Marshal(map[string]any{key: map[string]any{"primary_window": window}})
+			snap, err := parseUsageResponse(raw, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The same merge and JSON round trip is used by the existing collector.
+			encoded, _ := json.Marshal((Snapshot{}).withUsage(snap))
+			var saved map[string]any
+			json.Unmarshal(encoded, &saved)
+			got, ok := saved["generation_weekly_remaining_pct"].(float64)
+			if tc.want == nil {
+				if ok {
+					t.Fatalf("unknown became known: %s", encoded)
+				}
+				return
+			}
+			if !ok || got < *tc.want-0.000001 || got > *tc.want+0.000001 {
+				t.Fatalf("exact remaining lost: %s", encoded)
+			}
+		})
+	}
+}
+
+func floatPointer(n float64) *float64 { return &n }
+
 func TestWeeklyRoutingMetadataDoesNotUseOtherQuotaOrInventReset(t *testing.T) {
 	now := time.Date(2030, 1, 1, 12, 0, 0, 0, time.UTC)
 	for _, kind := range []string{"code-review", "short", "missing", "past", "too-far"} {
